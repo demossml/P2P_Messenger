@@ -120,6 +120,7 @@ Current e2e scenario:
 - `FilesPanel` persists selected filter/sort preferences in `localStorage`.
 - File chunk/assembly happy-path logic is extracted to `file-transfer-utils` and covered by dedicated unit tests (chunk count, missing chunks, assemble, missing-chunk failure).
 - If receiver detects file integrity failure (for example checksum mismatch), it now sends `file-ack: rejected`, so sender also finalizes transfer as failed instead of hanging in `sending/accepted`.
+- Outgoing file transfers are now kept across temporary peer disconnects (state is not dropped immediately), so reconnect/reannounce can continue transfer negotiation instead of failing instantly.
 - Fingerprint verification state/side-effects are encapsulated in `useFingerprintVerification`.
 - Client entrypoint is split into `app.tsx` (UI composition) and `main.tsx` (React bootstrap).
 - Client has Vitest + jsdom tests for `useFingerprintVerification`, `SecurityPanel`, and `ChatPanel` (`pnpm test` / `pnpm --filter @p2p/client test`).

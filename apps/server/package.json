@@ -1,0 +1,26 @@
+{
+  "name": "@p2p/server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --env-file=../../.env --import tsx --watch src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "lint": "eslint src --ext .ts",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@p2p/shared": "workspace:*",
+    "ioredis": "^5.7.0",
+    "jose": "^6.1.0",
+    "uWebSockets.js": "github:uNetworking/uWebSockets.js#v20.51.0",
+    "uuid": "^11.1.0",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.3",
+    "vitest": "^3.2.4"
+  }
+}
