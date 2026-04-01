@@ -45,6 +45,7 @@ export class SignalingTransport {
     this.activeRoomId = roomId;
     this.persistRoomId(roomId);
     this.manualClose = false;
+    this.reconnectAttempt = 0;
     this.openSocket('connecting');
   }
 
@@ -101,28 +102,44 @@ export class SignalingTransport {
     this.clearReconnectTimer();
     this.onStatus(status);
 
-    if (this.socket) {
-      this.socket.close();
-    }
-
+    const previousSocket = this.socket;
     const socket = new WebSocket(this.options.url);
     this.socket = socket;
+    if (previousSocket) {
+      previousSocket.close();
+    }
 
     socket.addEventListener('open', () => {
+      if (this.socket !== socket) {
+        return;
+      }
+
       this.reconnectAttempt = 0;
       this.onStatus('connected');
       void this.sendJoin();
     });
 
     socket.addEventListener('message', (event) => {
+      if (this.socket !== socket) {
+        return;
+      }
+
       this.handleMessage(event.data);
     });
 
     socket.addEventListener('error', () => {
+      if (this.socket !== socket) {
+        return;
+      }
+
       this.onError(new Error('WebSocket signaling error.'));
     });
 
     socket.addEventListener('close', () => {
+      if (this.socket !== socket) {
+        return;
+      }
+
       if (this.manualClose || !this.activeRoomId) {
         this.onStatus('closed');
         return;

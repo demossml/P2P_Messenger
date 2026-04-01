@@ -60,6 +60,67 @@ class FakeRedis {
   public getExpiryForKey(key: string): number | undefined {
     return this.expirySeconds.get(key);
   }
+
+  public async eval(
+    _script: string,
+    _numKeys: number,
+    key: string,
+    peerId: string,
+    peerPublicKey: string,
+    maxPeersRaw: string,
+    ttlRaw: string
+  ): Promise<string[]> {
+    const maxPeers = Number(maxPeersRaw);
+    const ttlSeconds = Number(ttlRaw);
+    const peers = await this.hgetall(key);
+    const existingIds = Object.keys(peers);
+    const isExisting = existingIds.includes(peerId);
+
+    if (!isExisting && existingIds.length >= maxPeers) {
+      return ['full'];
+    }
+
+    await this.hset(key, peerId, peerPublicKey);
+    await this.expire(key, ttlSeconds);
+
+    const result = ['ok'];
+    for (const existingPeerId of existingIds) {
+      if (existingPeerId === peerId) {
+        continue;
+      }
+      result.push(existingPeerId, peers[existingPeerId] ?? '');
+    }
+
+    return result;
+  }
+}
+
+class FakeRedisNoEval {
+  private readonly base = new FakeRedis();
+
+  public async hgetall(key: string): Promise<Record<string, string>> {
+    return this.base.hgetall(key);
+  }
+
+  public async hset(key: string, field: string, value: string): Promise<number> {
+    return this.base.hset(key, field, value);
+  }
+
+  public async hdel(key: string, field: string): Promise<number> {
+    return this.base.hdel(key, field);
+  }
+
+  public async hlen(key: string): Promise<number> {
+    return this.base.hlen(key);
+  }
+
+  public async del(key: string): Promise<number> {
+    return this.base.del(key);
+  }
+
+  public async expire(key: string, seconds: number): Promise<number> {
+    return this.base.expire(key, seconds);
+  }
 }
 
 describe('RoomManager', () => {
@@ -105,6 +166,35 @@ describe('RoomManager', () => {
     ).rejects.toThrowError('ROOM_IS_FULL');
   });
 
+  it('allows same peer to rejoin when room is full and refreshes its public key', async () => {
+    const redis = new FakeRedis();
+    const manager = new RoomManager(redis as never, 3600, 1);
+    const roomId = 'room-rejoin';
+    const peerId = '11111111-1111-4111-8111-111111111111';
+
+    await manager.joinRoom(roomId, {
+      peerId,
+      peerPublicKey: 'pub-1'
+    });
+
+    await expect(
+      manager.joinRoom(roomId, {
+        peerId: '22222222-2222-4222-8222-222222222222',
+        peerPublicKey: 'pub-2'
+      })
+    ).rejects.toThrowError('ROOM_IS_FULL');
+
+    const existing = await manager.joinRoom(roomId, {
+      peerId,
+      peerPublicKey: 'pub-1-updated'
+    });
+
+    expect(existing).toEqual([]);
+    const peers = await redis.hgetall('room:room-rejoin:peers');
+    expect(peers[peerId]).toBe('pub-1-updated');
+    expect(redis.getExpiryForKey('room:room-rejoin:peers')).toBe(3600);
+  });
+
   it('removes room key when last peer leaves and extends ttl otherwise', async () => {
     const redis = new FakeRedis();
     const manager = new RoomManager(redis as never, 1800, 8);
@@ -124,5 +214,26 @@ describe('RoomManager', () => {
 
     await manager.leaveRoom(roomId, '22222222-2222-4222-8222-222222222222');
     expect(await redis.hlen('room:room-leave:peers')).toBe(0);
+  });
+
+  it('falls back to non-eval flow when redis eval is unavailable', async () => {
+    const redis = new FakeRedisNoEval();
+    const manager = new RoomManager(redis as never, 900, 2);
+
+    await manager.joinRoom('room-fallback', {
+      peerId: '11111111-1111-4111-8111-111111111111',
+      peerPublicKey: 'pub-1'
+    });
+    const existing = await manager.joinRoom('room-fallback', {
+      peerId: '22222222-2222-4222-8222-222222222222',
+      peerPublicKey: 'pub-2'
+    });
+
+    expect(existing).toEqual([
+      {
+        peerId: '11111111-1111-4111-8111-111111111111',
+        peerPublicKey: 'pub-1'
+      }
+    ]);
   });
 });

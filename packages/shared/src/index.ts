@@ -163,6 +163,21 @@ export const chatFileAckPayloadSchema = z.object({
   missingChunks: z.array(z.number().int().min(0)).max(100_000).optional()
 });
 
+export const chatEncryptedPayloadSchema = z.object({
+  type: z.literal('encrypted'),
+  ivBase64: z.string().min(1).max(256),
+  ciphertextBase64: z.string().min(1).max(200_000)
+});
+
+export const chatPlainPayloadSchema = z.discriminatedUnion('type', [
+  chatTextPayloadSchema,
+  chatReactionPayloadSchema,
+  chatReceiptPayloadSchema,
+  chatFileMetaPayloadSchema,
+  chatFileChunkPayloadSchema,
+  chatFileAckPayloadSchema
+]);
+
 export const chatMessageSchema = baseChatMessageSchema.extend({
   payload: z.discriminatedUnion('type', [
     chatTextPayloadSchema,
@@ -170,7 +185,8 @@ export const chatMessageSchema = baseChatMessageSchema.extend({
     chatReceiptPayloadSchema,
     chatFileMetaPayloadSchema,
     chatFileChunkPayloadSchema,
-    chatFileAckPayloadSchema
+    chatFileAckPayloadSchema,
+    chatEncryptedPayloadSchema
   ])
 });
 

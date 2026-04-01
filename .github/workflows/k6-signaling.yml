@@ -1,55 +1,21 @@
-name: CI
+name: K6 Signaling
 
 on:
-  pull_request:
-  push:
-    branches:
-      - main
   workflow_dispatch:
     inputs:
-      validation:
-        description: "Manual validation target"
+      profile:
+        description: "k6 profile to run"
         required: true
-        default: smoke-and-e2e
+        default: quick
         type: choice
         options:
-          - smoke-only
-          - e2e-only
-          - smoke-and-e2e
-          - smoke-e2e-k6
+          - quick
+          - stress
+  schedule:
+    - cron: "0 2 * * *"
 
 jobs:
-  checks:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 10
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: pnpm
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Lint
-        run: pnpm lint
-
-      - name: Typecheck
-        run: pnpm typecheck
-
-      - name: Build
-        run: pnpm build
-
-  manual-validation:
-    if: ${{ github.event_name == 'workflow_dispatch' }}
+  k6-signaling:
     runs-on: ubuntu-latest
     services:
       redis:
@@ -61,7 +27,9 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+
     env:
+      K6_PROFILE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.profile || 'quick' }}
       NODE_ENV: development
       PORT: 3001
       ALLOWED_ORIGIN: http://localhost:5173
@@ -113,6 +81,7 @@ jobs:
         WIZcU2sGacLQNjGqV56yIZf82GaSFuE6KXidS2z4CUI0YA/yYmgTo9lkaTkGOLLH
         6wIDAQAB
         -----END PUBLIC KEY-----
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -128,132 +97,94 @@ jobs:
           node-version: 22
           cache: pnpm
 
+      - name: Setup k6
+        uses: grafana/setup-k6-action@v1
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
-
-      - name: Install Playwright browser
-        if: ${{ github.event.inputs.validation != 'smoke-only' }}
-        run: pnpm exec playwright install chromium
-
-      - name: Setup k6
-        if: ${{ github.event.inputs.validation == 'smoke-e2e-k6' }}
-        uses: grafana/setup-k6-action@v1
 
       - name: Start signaling server
         run: |
           pnpm --filter @p2p/server exec node --import tsx src/index.ts > /tmp/signaling.log 2>&1 &
           echo $! > /tmp/signaling.pid
 
-      - name: Start client dev server
-        run: |
-          pnpm --filter @p2p/client dev --host 127.0.0.1 --port 5173 > /tmp/client.log 2>&1 &
-          echo $! > /tmp/client.pid
-
-      - name: Wait for health endpoints
+      - name: Wait for health
         run: |
           for i in {1..60}; do
             if curl -fsS http://127.0.0.1:3001/health >/dev/null; then
-              break
+              exit 0
             fi
             sleep 1
           done
-          curl -fsS http://127.0.0.1:3001/health >/dev/null
+          echo "Server did not become healthy in time"
+          tail -n 120 /tmp/signaling.log || true
+          exit 1
 
-          for i in {1..60}; do
-            if curl -fsS http://127.0.0.1:5173 >/dev/null; then
-              break
-            fi
-            sleep 1
-          done
-          curl -fsS http://127.0.0.1:5173 >/dev/null
-
-      - name: Run smoke suite
-        if: ${{ github.event.inputs.validation != 'e2e-only' }}
-        run: pnpm smoke:all
-
-      - name: Run e2e suite
-        if: ${{ github.event.inputs.validation != 'smoke-only' }}
-        run: pnpm e2e
-
-      - name: Run k6 quick load baseline
-        if: ${{ github.event.inputs.validation == 'smoke-e2e-k6' }}
+      - name: Run k6 quick profile
+        if: ${{ env.K6_PROFILE == 'quick' }}
         run: pnpm load:k6:signaling:quick:summary
 
-      - name: Render k6 summary
-        if: ${{ always() && github.event.inputs.validation == 'smoke-e2e-k6' }}
+      - name: Run k6 stress profile
+        if: ${{ env.K6_PROFILE == 'stress' }}
+        run: pnpm load:k6:signaling:stress:summary
+
+      - name: Render k6 run summary
+        if: always()
         run: |
-          SUMMARY_FILE="artifacts/k6/signaling-quick-summary.json"
+          SUMMARY_FILE="artifacts/k6/signaling-${K6_PROFILE}-summary.json"
           if [ -f "$SUMMARY_FILE" ]; then
-            node scripts/load/render-k6-summary.mjs "$SUMMARY_FILE" "quick" >> "$GITHUB_STEP_SUMMARY"
+            node scripts/load/render-k6-summary.mjs "$SUMMARY_FILE" "$K6_PROFILE" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "### K6 Summary (quick)" >> "$GITHUB_STEP_SUMMARY"
+            echo "### K6 Summary (${K6_PROFILE})" >> "$GITHUB_STEP_SUMMARY"
             echo "" >> "$GITHUB_STEP_SUMMARY"
             echo "Summary file not found: \`$SUMMARY_FILE\`" >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      - name: Fetch previous quick baseline artifact
-        if: ${{ always() && github.event.inputs.validation == 'smoke-e2e-k6' }}
+      - name: Fetch previous baseline artifact
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          node scripts/load/fetch-latest-k6-baseline.mjs quick artifacts/k6/quick-baseline.json
+          node scripts/load/fetch-latest-k6-baseline.mjs "${K6_PROFILE}" "artifacts/k6/${K6_PROFILE}-baseline.json"
 
-      - name: Compare quick k6 run against previous baseline
-        if: ${{ always() && github.event.inputs.validation == 'smoke-e2e-k6' }}
+      - name: Compare current run against previous baseline
         run: |
-          if [ -f "artifacts/k6/quick-baseline.json" ]; then
-            pnpm load:k6:compare -- "artifacts/k6/quick-baseline.json" "artifacts/k6/signaling-quick-summary.json"
+          if [ -f "artifacts/k6/${K6_PROFILE}-baseline.json" ]; then
+            pnpm load:k6:compare -- "artifacts/k6/${K6_PROFILE}-baseline.json" "artifacts/k6/signaling-${K6_PROFILE}-summary.json"
           else
-            echo "No previous baseline found for quick profile; skipping compare."
+            echo "No previous baseline found for profile ${K6_PROFILE}; skipping compare."
           fi
 
       - name: Render k6 trend
-        if: ${{ always() && github.event.inputs.validation == 'smoke-e2e-k6' }}
+        if: always()
         run: |
-          SUMMARY_FILE="artifacts/k6/signaling-quick-summary.json"
-          BASELINE_FILE="artifacts/k6/quick-baseline.json"
+          SUMMARY_FILE="artifacts/k6/signaling-${K6_PROFILE}-summary.json"
+          BASELINE_FILE="artifacts/k6/${K6_PROFILE}-baseline.json"
           if [ -f "$SUMMARY_FILE" ]; then
-            node scripts/load/render-k6-trend.mjs "$SUMMARY_FILE" "$BASELINE_FILE" quick >> "$GITHUB_STEP_SUMMARY"
+            node scripts/load/render-k6-trend.mjs "$SUMMARY_FILE" "$BASELINE_FILE" "$K6_PROFILE" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "### K6 Trend (quick)" >> "$GITHUB_STEP_SUMMARY"
+            echo "### K6 Trend (${K6_PROFILE})" >> "$GITHUB_STEP_SUMMARY"
             echo "" >> "$GITHUB_STEP_SUMMARY"
             echo "Summary file not found: \`$SUMMARY_FILE\`" >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      - name: Upload Playwright artifacts
-        if: ${{ always() && github.event.inputs.validation != 'smoke-only' }}
+      - name: Upload k6 summary artifact
         uses: actions/upload-artifact@v4
         with:
-          name: playwright-artifacts-${{ github.run_id }}
-          path: |
-            playwright-report
-            test-results
-          if-no-files-found: warn
+          name: k6-signaling-${{ env.K6_PROFILE }}-summary
+          path: artifacts/k6/signaling-${{ env.K6_PROFILE }}-summary.json
+          if-no-files-found: error
 
-      - name: Upload k6 artifacts
-        if: ${{ always() && github.event.inputs.validation == 'smoke-e2e-k6' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: k6-artifacts-${{ github.run_id }}
-          path: artifacts/k6/*.json
-          if-no-files-found: warn
-
-      - name: Upload runtime logs
+      - name: Upload signaling log
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: runtime-logs-${{ github.run_id }}
-          path: |
-            /tmp/signaling.log
-            /tmp/client.log
+          name: signaling-log-${{ github.run_id }}
+          path: /tmp/signaling.log
           if-no-files-found: warn
 
-      - name: Stop background services
+      - name: Stop signaling server
         if: always()
         run: |
-          if [ -f /tmp/client.pid ]; then
-            kill "$(cat /tmp/client.pid)" || true
-          fi
           if [ -f /tmp/signaling.pid ]; then
             kill "$(cat /tmp/signaling.pid)" || true
           fi

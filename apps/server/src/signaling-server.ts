@@ -398,7 +398,10 @@ export class SignalingServer {
       return;
     }
 
-    if (connection.peer && connection.peer.roomId !== message.roomId) {
+    if (
+      connection.peer &&
+      (connection.peer.roomId !== message.roomId || connection.peer.peerId !== message.peerId)
+    ) {
       await this.leaveCurrentRoom(socket);
     }
 

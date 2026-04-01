@@ -76,4 +76,20 @@ describe('chatMessageSchema', () => {
 
     expect(parsed.success).toBe(false);
   });
+
+  it('parses encrypted payload envelope', () => {
+    const parsed = chatMessageSchema.parse({
+      id: '77777777-7777-4777-8777-777777777777',
+      timestamp: Date.now(),
+      senderId: '88888888-8888-4888-8888-888888888888',
+      signature: 'base64-signature',
+      payload: {
+        type: 'encrypted',
+        ivBase64: 'YWJj',
+        ciphertextBase64: 'ZGVm'
+      }
+    });
+
+    expect(parsed.payload.type).toBe('encrypted');
+  });
 });

@@ -7,22 +7,36 @@ import {
   type ConnectionQuality
 } from '@p2p/webrtc';
 import {
+  base64ToBytes,
   bytesToBase64,
+  decryptAesGcm,
+  deriveSharedAes256GcmKey,
   deserializeSigningKeyPair,
+  encryptAesGcm,
+  exportEcdhPrivateKeyBase64,
+  exportEcdhPublicKeyBase64,
+  generateEcdhKeyPair,
   generateSigningKeyPair,
+  importEcdhPrivateKeyBase64,
+  importEcdhPublicKeyBase64,
   importSigningPublicKeyBase64,
   publicKeyFingerprint,
   serializeSigningKeyPair,
   signBytes,
   verifyBytes
 } from '@p2p/crypto';
-import type { ChatMessage } from '@p2p/shared';
+import { chatPlainPayloadSchema, type ChatMessage } from '@p2p/shared';
 import {
   assembleChunkMapToBytes,
   buildMissingChunkIndexes,
   computeTotalChunks,
   DEFAULT_FILE_CHUNK_SIZE_BYTES
 } from './file-transfer-utils.js';
+import {
+  migrateSigningIdentityFromSessionStorage,
+  readSigningIdentityFromIndexedDb,
+  writeSigningIdentityToIndexedDb
+} from './signing-key-store.js';
 
 type ConnectionStatus = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'closed';
 
@@ -111,6 +125,11 @@ type OutgoingPeerAckState = {
   error?: string;
 };
 
+type PeerPublicKeyBundle = {
+  signingPublicKeySpkiBase64: string;
+  ecdhPublicKeySpkiBase64?: string;
+};
+
 const PEER_ID_KEY = 'p2p.peerId';
 const PEER_PUBLIC_KEY_KEY = 'p2p.peerPublicKey';
 const PEER_PRIVATE_KEY_KEY = 'p2p.peerPrivateKey';
@@ -125,6 +144,7 @@ const FILE_META_MAX_RETRIES = 5;
 const RELAY_ENABLE_STREAK_REQUIRED = 2;
 const RELAY_DISABLE_STREAK_REQUIRED = 4;
 const RELAY_TOGGLE_COOLDOWN_MS = 15_000;
+const PEER_PUBLIC_KEY_BUNDLE_PREFIX = 'p2p-key-bundle-v1:';
 
 function getOrCreateStorageValue(key: string, fallbackFactory: () => string): string {
   const existingValue = sessionStorage.getItem(key);
@@ -211,6 +231,45 @@ function normalizeChunkIndexes(chunkIndexes: number[], totalChunks: number): num
   return Array.from(normalized).sort((left, right) => left - right);
 }
 
+function encodePeerPublicKeyBundle(bundle: PeerPublicKeyBundle): string {
+  return `${PEER_PUBLIC_KEY_BUNDLE_PREFIX}${bytesToBase64(
+    new TextEncoder().encode(JSON.stringify(bundle))
+  )}`;
+}
+
+function decodePeerPublicKeyBundle(rawValue: string): PeerPublicKeyBundle {
+  if (!rawValue.startsWith(PEER_PUBLIC_KEY_BUNDLE_PREFIX)) {
+    return {
+      signingPublicKeySpkiBase64: rawValue
+    };
+  }
+
+  const encoded = rawValue.slice(PEER_PUBLIC_KEY_BUNDLE_PREFIX.length);
+  const decodedJson = new TextDecoder().decode(base64ToBytes(encoded));
+  const parsed = JSON.parse(decodedJson) as Partial<PeerPublicKeyBundle>;
+
+  if (
+    typeof parsed.signingPublicKeySpkiBase64 !== 'string' ||
+    parsed.signingPublicKeySpkiBase64.length === 0
+  ) {
+    throw new Error('Peer key bundle is missing signing key.');
+  }
+
+  if (
+    parsed.ecdhPublicKeySpkiBase64 !== undefined &&
+    (typeof parsed.ecdhPublicKeySpkiBase64 !== 'string' || parsed.ecdhPublicKeySpkiBase64.length === 0)
+  ) {
+    throw new Error('Peer key bundle has invalid ecdh key.');
+  }
+
+  return {
+    signingPublicKeySpkiBase64: parsed.signingPublicKeySpkiBase64,
+    ...(parsed.ecdhPublicKeySpkiBase64
+      ? { ecdhPublicKeySpkiBase64: parsed.ecdhPublicKeySpkiBase64 }
+      : {})
+  };
+}
+
 export function useSignaling(): {
   status: ConnectionStatus;
   roomId: string;
@@ -277,9 +336,7 @@ export function useSignaling(): {
   });
   const [localFingerprint, setLocalFingerprint] = useState<string | null>(null);
   const [remoteFingerprints, setRemoteFingerprints] = useState<PeerFingerprintEntry[]>([]);
-  const [peerPublicKey, setPeerPublicKey] = useState<string>(
-    () => sessionStorage.getItem(PEER_PUBLIC_KEY_KEY) ?? ''
-  );
+  const [peerPublicKey, setPeerPublicKey] = useState<string>('');
   const [isSigningReady, setIsSigningReady] = useState<boolean>(false);
 
   const transportRef = useRef<SignalingTransport | null>(null);
@@ -296,8 +353,11 @@ export function useSignaling(): {
     new Map()
   );
   const signingPrivateKeyRef = useRef<CryptoKey | null>(null);
+  const ecdhPrivateKeyRef = useRef<CryptoKey | null>(null);
   const remotePeerPublicKeySpkiRef = useRef<Map<string, string>>(new Map());
+  const remotePeerEcdhPublicKeySpkiRef = useRef<Map<string, string>>(new Map());
   const remotePeerVerifyKeyRef = useRef<Map<string, CryptoKey>>(new Map());
+  const sharedEncryptionKeysRef = useRef<Map<string, CryptoKey>>(new Map());
   const remotePeerFingerprintRef = useRef<Map<string, string>>(new Map());
   const bitrateByPeerRef = useRef<Map<string, number>>(new Map());
   const statsTrackingStartedAtRef = useRef<number | null>(null);
@@ -332,17 +392,108 @@ export function useSignaling(): {
     );
   }
 
-  async function createSignedMessage(payload: ChatMessage['payload']): Promise<ChatMessage> {
+  async function getOrCreateSharedEncryptionKey(peerId: string): Promise<CryptoKey | null> {
+    const existingKey = sharedEncryptionKeysRef.current.get(peerId);
+    if (existingKey) {
+      return existingKey;
+    }
+
+    const localPrivate = ecdhPrivateKeyRef.current;
+    const peerPublicSpki = remotePeerEcdhPublicKeySpkiRef.current.get(peerId);
+    if (!localPrivate || !peerPublicSpki) {
+      return null;
+    }
+
+    const peerPublicKey = await importEcdhPublicKeyBase64(peerPublicSpki);
+    const sharedKey = await deriveSharedAes256GcmKey(localPrivate, peerPublicKey);
+    sharedEncryptionKeysRef.current.set(peerId, sharedKey);
+    return sharedKey;
+  }
+
+async function encryptPayloadForPeer(
+    peerId: string,
+    payload: ChatMessage['payload']
+  ): Promise<ChatMessage['payload']> {
+    if (payload.type === 'encrypted') {
+      return payload;
+    }
+
+    const sharedKey = await getOrCreateSharedEncryptionKey(peerId);
+    if (!sharedKey) {
+      return payload;
+    }
+
+    const encrypted = await encryptAesGcm(sharedKey, JSON.stringify(payload));
+    return {
+      type: 'encrypted',
+      ivBase64: encrypted.ivBase64,
+      ciphertextBase64: encrypted.ciphertextBase64
+    };
+  }
+
+  async function decryptPayloadFromPeer(
+    peerId: string,
+    payload: ChatMessage['payload']
+  ): Promise<ChatMessage['payload'] | null> {
+    if (payload.type !== 'encrypted') {
+      return payload;
+    }
+
+    const sharedKey = await getOrCreateSharedEncryptionKey(peerId);
+    if (!sharedKey) {
+      setLastError(`Missing encryption session key for peer ${peerId.slice(0, 8)}.`);
+      return null;
+    }
+
+    try {
+      const plaintext = await decryptAesGcm(
+        sharedKey,
+        {
+          ivBase64: payload.ivBase64,
+          ciphertextBase64: payload.ciphertextBase64
+        },
+        'string'
+      );
+      if (typeof plaintext !== 'string') {
+        setLastError(`Rejected encrypted payload with invalid plaintext type from ${peerId.slice(0, 8)}.`);
+        return null;
+      }
+      const parsed = JSON.parse(plaintext) as unknown;
+      const validated = chatPlainPayloadSchema.safeParse(parsed);
+      if (!validated.success) {
+        setLastError(`Rejected encrypted payload with invalid schema from ${peerId.slice(0, 8)}.`);
+        return null;
+      }
+      return validated.data;
+    } catch (error) {
+      setLastError(
+        error instanceof Error
+          ? `Failed to decrypt message from ${peerId.slice(0, 8)}: ${error.message}`
+          : `Failed to decrypt message from ${peerId.slice(0, 8)}.`
+      );
+      return null;
+    }
+  }
+
+  async function createSignedMessageForPeer(
+    peerId: string,
+    payload: ChatMessage['payload'],
+    options?: {
+      id?: string;
+      timestamp?: number;
+    }
+  ): Promise<ChatMessage> {
     const privateKey = signingPrivateKeyRef.current;
     if (!privateKey) {
       throw new Error('Signing key is not initialized yet.');
     }
 
+    const payloadForMessage = await encryptPayloadForPeer(peerId, payload);
     const unsigned = {
-      id: crypto.randomUUID(),
-      timestamp: Date.now(),
+      id: options?.id ?? crypto.randomUUID(),
+      timestamp: options?.timestamp ?? Date.now(),
       senderId: identity.peerId,
-      payload
+      payload: payloadForMessage
     };
 
     const signature = await signBytes(privateKey, new TextEncoder().encode(JSON.stringify(unsigned)));
@@ -352,11 +503,20 @@ export function useSignaling(): {
     };
   }
 
-  async function rememberRemotePeerKey(peerId: string, publicKeySpkiBase64: string): Promise<void> {
-    remotePeerPublicKeySpkiRef.current.set(peerId, publicKeySpkiBase64);
-    const verifyKey = await importSigningPublicKeyBase64(publicKeySpkiBase64);
+  async function rememberRemotePeerKey(peerId: string, publicKeyBundleRaw: string): Promise<void> {
+    const bundle = decodePeerPublicKeyBundle(publicKeyBundleRaw);
+
+    remotePeerPublicKeySpkiRef.current.set(peerId, bundle.signingPublicKeySpkiBase64);
+    if (bundle.ecdhPublicKeySpkiBase64) {
+      remotePeerEcdhPublicKeySpkiRef.current.set(peerId, bundle.ecdhPublicKeySpkiBase64);
+    } else {
+      remotePeerEcdhPublicKeySpkiRef.current.delete(peerId);
+    }
+    sharedEncryptionKeysRef.current.delete(peerId);
+
+    const verifyKey = await importSigningPublicKeyBase64(bundle.signingPublicKeySpkiBase64);
     remotePeerVerifyKeyRef.current.set(peerId, verifyKey);
-    const fingerprint = await publicKeyFingerprint(publicKeySpkiBase64);
+    const fingerprint = await publicKeyFingerprint(bundle.signingPublicKeySpkiBase64);
     remotePeerFingerprintRef.current.set(peerId, fingerprint);
     syncRemoteFingerprintsState();
   }
@@ -541,7 +701,7 @@ export function useSignaling(): {
       return false;
     }
 
-      const message = await createSignedMessage({
+      const message = await createSignedMessageForPeer(peerId, {
         type: 'file-meta',
         fileId: transfer.fileId,
         name: transfer.name,
@@ -573,7 +733,7 @@ export function useSignaling(): {
       const chunkBuffer = transfer.fileBuffer.slice(start, end);
       const chunkData = bytesToBase64(new Uint8Array(chunkBuffer));
 
-      const message = await createSignedMessage({
+      const message = await createSignedMessageForPeer(peerId, {
         type: 'file-chunk',
         fileId: transfer.fileId,
         chunkIndex,
@@ -643,27 +803,67 @@ export function useSignaling(): {
   useEffect(() => {
     void (async () => {
       try {
-        const storedPublic = sessionStorage.getItem(PEER_PUBLIC_KEY_KEY);
-        const storedPrivate = sessionStorage.getItem(PEER_PRIVATE_KEY_KEY);
+        const migrated = await migrateSigningIdentityFromSessionStorage(
+          PEER_PUBLIC_KEY_KEY,
+          PEER_PRIVATE_KEY_KEY
+        ).catch(() => null);
+        const storedIdentity = migrated ?? (await readSigningIdentityFromIndexedDb().catch(() => null));
 
-        if (storedPublic && storedPrivate) {
-          const keyPair = await deserializeSigningKeyPair({
-            publicKeySpkiBase64: storedPublic,
-            privateKeyPkcs8Base64: storedPrivate
+        if (storedIdentity) {
+          const signingKeyPair = await deserializeSigningKeyPair({
+            publicKeySpkiBase64: storedIdentity.publicKeySpkiBase64,
+            privateKeyPkcs8Base64: storedIdentity.privateKeyPkcs8Base64
           });
-          signingPrivateKeyRef.current = keyPair.privateKey;
-          setPeerPublicKey(storedPublic);
-          setLocalFingerprint(await publicKeyFingerprint(storedPublic));
+          signingPrivateKeyRef.current = signingKeyPair.privateKey;
+
+          let ecdhPublicKeySpkiBase64 = storedIdentity.ecdhPublicKeySpkiBase64;
+          if (storedIdentity.ecdhPrivateKeyPkcs8Base64 && storedIdentity.ecdhPublicKeySpkiBase64) {
+            ecdhPrivateKeyRef.current = await importEcdhPrivateKeyBase64(
+              storedIdentity.ecdhPrivateKeyPkcs8Base64
+            );
+          } else {
+            const ecdhKeyPair = await generateEcdhKeyPair(true);
+            ecdhPrivateKeyRef.current = ecdhKeyPair.privateKey;
+            ecdhPublicKeySpkiBase64 = await exportEcdhPublicKeyBase64(ecdhKeyPair.publicKey);
+            const ecdhPrivateKeyPkcs8Base64 = await exportEcdhPrivateKeyBase64(
+              ecdhKeyPair.privateKey
+            );
+            await writeSigningIdentityToIndexedDb({
+              ...storedIdentity,
+              ecdhPublicKeySpkiBase64,
+              ecdhPrivateKeyPkcs8Base64
+            });
+          }
+
+          setPeerPublicKey(
+            encodePeerPublicKeyBundle({
+              signingPublicKeySpkiBase64: storedIdentity.publicKeySpkiBase64,
+              ...(ecdhPublicKeySpkiBase64 ? { ecdhPublicKeySpkiBase64 } : {})
+            })
+          );
+          setLocalFingerprint(await publicKeyFingerprint(storedIdentity.publicKeySpkiBase64));
           setIsSigningReady(true);
           return;
         }
 
         const generatedKeyPair = await generateSigningKeyPair(true);
+        const ecdhKeyPair = await generateEcdhKeyPair(true);
         const serialized = await serializeSigningKeyPair(generatedKeyPair);
-        sessionStorage.setItem(PEER_PUBLIC_KEY_KEY, serialized.publicKeySpkiBase64);
-        sessionStorage.setItem(PEER_PRIVATE_KEY_KEY, serialized.privateKeyPkcs8Base64);
+        const ecdhPublicKeySpkiBase64 = await exportEcdhPublicKeyBase64(ecdhKeyPair.publicKey);
+        const ecdhPrivateKeyPkcs8Base64 = await exportEcdhPrivateKeyBase64(ecdhKeyPair.privateKey);
+        await writeSigningIdentityToIndexedDb({
+          ...serialized,
+          ecdhPublicKeySpkiBase64,
+          ecdhPrivateKeyPkcs8Base64
+        });
         signingPrivateKeyRef.current = generatedKeyPair.privateKey;
-        setPeerPublicKey(serialized.publicKeySpkiBase64);
+        ecdhPrivateKeyRef.current = ecdhKeyPair.privateKey;
+        setPeerPublicKey(
+          encodePeerPublicKeyBundle({
+            signingPublicKeySpkiBase64: serialized.publicKeySpkiBase64,
+            ecdhPublicKeySpkiBase64
+          })
+        );
         setLocalFingerprint(await publicKeyFingerprint(serialized.publicKeySpkiBase64));
         setIsSigningReady(true);
       } catch (error) {
@@ -735,7 +935,9 @@ export function useSignaling(): {
         }
         if (message.type === 'peer-left') {
           remotePeerPublicKeySpkiRef.current.delete(message.peerId);
+          remotePeerEcdhPublicKeySpkiRef.current.delete(message.peerId);
           remotePeerVerifyKeyRef.current.delete(message.peerId);
+          sharedEncryptionKeysRef.current.delete(message.peerId);
           remotePeerFingerprintRef.current.delete(message.peerId);
           syncRemoteFingerprintsState();
         }
@@ -844,7 +1046,9 @@ export function useSignaling(): {
         remotePeerIdsRef.current.delete(peerId);
         remoteStreamsMapRef.current.delete(peerId);
         remotePeerPublicKeySpkiRef.current.delete(peerId);
+        remotePeerEcdhPublicKeySpkiRef.current.delete(peerId);
         remotePeerVerifyKeyRef.current.delete(peerId);
+        sharedEncryptionKeysRef.current.delete(peerId);
         remotePeerFingerprintRef.current.delete(peerId);
         syncRemoteFingerprintsState();
         for (const [fileId, peerStates] of outgoingTransferPeerStateRef.current.entries()) {
@@ -882,7 +1086,10 @@ export function useSignaling(): {
             return;
           }
 
-          const payload = message.payload;
+          const payload = await decryptPayloadFromPeer(peerId, message.payload);
+          if (!payload) {
+            return;
+          }
 
         if (payload.type === 'text') {
           setChatMessages((current) => [
@@ -900,7 +1107,7 @@ export function useSignaling(): {
 
           if (message.senderId !== identity.peerId) {
             void (async () => {
-              const receipt = await createSignedMessage({
+              const receipt = await createSignedMessageForPeer(peerId, {
                 type: 'receipt',
                 messageId: message.id
               });
@@ -991,7 +1198,7 @@ export function useSignaling(): {
 
           if (transfer.status === 'completed') {
             void (async () => {
-              const ack = await createSignedMessage({
+              const ack = await createSignedMessageForPeer(peerId, {
                 type: 'file-ack',
                 fileId: payload.fileId,
                 status: 'complete'
@@ -1004,7 +1211,7 @@ export function useSignaling(): {
           const missingChunks = buildMissingChunkIndexes(payload.totalChunks, existingChunks);
 
           void (async () => {
-            const ack = await createSignedMessage({
+            const ack = await createSignedMessageForPeer(peerId, {
               type: 'file-ack',
               fileId: payload.fileId,
               status: 'accepted',
@@ -1047,13 +1254,17 @@ export function useSignaling(): {
           void (async () => {
             try {
               const merged = assembleChunkMapToBytes(meta.totalChunks, chunks);
+              const mergedBuffer = merged.buffer.slice(
+                merged.byteOffset,
+                merged.byteOffset + merged.byteLength
+              ) as ArrayBuffer;
 
-              const checksum = `sha256:${await sha256Hex(merged.buffer)}`;
+              const checksum = `sha256:${await sha256Hex(mergedBuffer)}`;
               if (checksum !== meta.checksum) {
                 throw new Error('Checksum mismatch.');
               }
 
-              const downloadUrl = URL.createObjectURL(new Blob([merged]));
+              const downloadUrl = URL.createObjectURL(new Blob([mergedBuffer]));
               const completedTransfer: FileTransferEntry = {
                 ...meta,
                 receivedChunks: meta.totalChunks,
@@ -1066,7 +1277,7 @@ export function useSignaling(): {
                 current.map((entry) => (entry.fileId === payload.fileId ? completedTransfer : entry))
               );
 
-              const ack = await createSignedMessage({
+              const ack = await createSignedMessageForPeer(peerId, {
                 type: 'file-ack',
                 fileId: payload.fileId,
                 status: 'complete'
@@ -1086,7 +1297,7 @@ export function useSignaling(): {
                 )
               );
 
-              const ack = await createSignedMessage({
+              const ack = await createSignedMessageForPeer(peerId, {
                 type: 'file-ack',
                 fileId: payload.fileId,
                 status: 'rejected',
@@ -1569,19 +1780,29 @@ export function useSignaling(): {
       }
 
       void (async () => {
-        const message = await createSignedMessage({
-          type: 'text',
-          text: trimmedText
-        });
+        const manager = peerManagerRef.current;
+        const messageId = crypto.randomUUID();
+        const timestamp = Date.now();
+        const peers = manager?.getConnections().map((entry) => entry.peerId) ?? [];
+        for (const peerId of peers) {
+          const message = await createSignedMessageForPeer(
+            peerId,
+            {
+              type: 'text',
+              text: trimmedText
+            },
+            { id: messageId, timestamp }
+          );
+          await manager?.sendChatMessage(peerId, message);
+        }
 
-        await peerManagerRef.current?.sendChatMessageToAll(message);
         setChatMessages((current) => [
           ...current,
           {
-            id: message.id,
-            senderId: message.senderId,
+            id: messageId,
+            senderId: identity.peerId,
             text: trimmedText,
-            timestamp: message.timestamp,
+            timestamp,
             incoming: false,
             readBy: [],
             reactions: []
@@ -1596,13 +1817,22 @@ export function useSignaling(): {
       }
 
       void (async () => {
-        const reactionMessage = await createSignedMessage({
-          type: 'reaction',
-          messageId,
-          emoji: normalizedEmoji
-        });
-
-        await peerManagerRef.current?.sendChatMessageToAll(reactionMessage);
+        const manager = peerManagerRef.current;
+        const reactionId = crypto.randomUUID();
+        const timestamp = Date.now();
+        const peers = manager?.getConnections().map((entry) => entry.peerId) ?? [];
+        for (const peerId of peers) {
+          const reactionMessage = await createSignedMessageForPeer(
+            peerId,
+            {
+              type: 'reaction',
+              messageId,
+              emoji: normalizedEmoji
+            },
+            { id: reactionId, timestamp }
+          );
+          await manager?.sendChatMessage(peerId, reactionMessage);
+        }
         setChatMessages((current) =>
           current.map((entry) => {
             if (entry.id !== messageId) {

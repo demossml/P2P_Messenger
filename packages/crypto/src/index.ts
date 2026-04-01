@@ -158,6 +158,21 @@ export async function importEcdhPublicKeyBase64(publicKeySpkiBase64: string): Pr
   );
 }
 
+export async function exportEcdhPrivateKeyBase64(privateKey: CryptoKey): Promise<string> {
+  const pkcs8 = await crypto.subtle.exportKey('pkcs8', privateKey);
+  return bytesToBase64(new Uint8Array(pkcs8));
+}
+
+export async function importEcdhPrivateKeyBase64(privateKeyPkcs8Base64: string): Promise<CryptoKey> {
+  return crypto.subtle.importKey(
+    'pkcs8',
+    toArrayBuffer(base64ToBytes(privateKeyPkcs8Base64)),
+    { name: 'ECDH', namedCurve: 'P-256' },
+    false,
+    ['deriveKey']
+  );
+}
+
 export async function deriveSharedAes256GcmKey(
   privateKey: CryptoKey,
   peerPublicKey: CryptoKey

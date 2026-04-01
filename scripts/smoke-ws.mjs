@@ -153,6 +153,35 @@ async function main() {
     throw new Error('[smoke:ws] B got unexpected peerPublicKey for peer A.');
   }
 
+  const peerARejoin = {
+    peerId: randomUUID(),
+    peerPublicKey: `smoke-public-key-a-rejoin-${Date.now()}`
+  };
+
+  wsA.send(
+    JSON.stringify({
+      type: 'join',
+      roomId: ROOM_ID,
+      peerId: peerARejoin.peerId,
+      token: tokenA,
+      peerPublicKey: peerARejoin.peerPublicKey
+    })
+  );
+
+  await waitForMessage(
+    messagesB,
+    (message) => message.type === 'peer-left' && message.peerId === peerA.peerId,
+    'peer-left (B saw old A id leave after rejoin)'
+  );
+  const bSawPeerARejoin = await waitForMessage(
+    messagesB,
+    (message) => message.type === 'peer-joined' && message.peerId === peerARejoin.peerId,
+    'peer-joined (B saw A rejoin with new id)'
+  );
+  if (bSawPeerARejoin.peerPublicKey !== peerARejoin.peerPublicKey) {
+    throw new Error('[smoke:ws] B got unexpected peerPublicKey for rejoined peer A.');
+  }
+
   wsB.send(
     JSON.stringify({
       type: 'leave',
