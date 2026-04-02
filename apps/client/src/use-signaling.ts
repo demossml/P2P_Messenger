@@ -149,6 +149,8 @@ const MAX_REACTION_LENGTH = 16;
 const RELAY_ENABLE_STREAK_REQUIRED = 2;
 const RELAY_DISABLE_STREAK_REQUIRED = 4;
 const RELAY_TOGGLE_COOLDOWN_MS = 15_000;
+const CHAT_SEND_RETRY_ATTEMPTS = 20;
+const CHAT_SEND_RETRY_DELAY_MS = 250;
 
 function getOrCreateStorageValue(key: string, fallbackFactory: () => string): string {
   const existingValue = sessionStorage.getItem(key);
@@ -171,6 +173,12 @@ function defaultApiBaseUrl(): string {
   const protocol = window.location.protocol;
   const host = window.location.hostname || 'localhost';
   return `${protocol}//${host}:3001`;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ms);
+  });
 }
 
 function parseJwtPayload(token: string): { exp?: number } | null {
@@ -626,6 +634,30 @@ export function useSignaling(): {
     syncOutgoingTransferUi(fileId);
   }
 
+  async function sendChatMessageWithRetry(
+    peerId: string,
+    message: ChatMessage,
+    attempts = CHAT_SEND_RETRY_ATTEMPTS
+  ): Promise<boolean> {
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      const manager = peerManagerRef.current;
+      if (!manager) {
+        return false;
+      }
+
+      const sent = await manager.sendChatMessage(peerId, message);
+      if (sent) {
+        return true;
+      }
+
+      if (attempt < attempts) {
+        await sleep(CHAT_SEND_RETRY_DELAY_MS);
+      }
+    }
+
+    return false;
+  }
+
   async function sendFileMetaToPeer(
     peerId: string,
     transfer: OutgoingFileTransfer
@@ -643,7 +675,10 @@ export function useSignaling(): {
       totalChunks: transfer.totalChunks,
       checksum: transfer.checksum
     });
-    await manager.sendChatMessage(peerId, message);
+    const sent = await sendChatMessageWithRetry(peerId, message);
+    if (!sent) {
+      return false;
+    }
 
     const peerState = getOrCreatePeerAckState(transfer.fileId, peerId);
     peerState.lastMetaSentAt = Date.now();
@@ -673,7 +708,10 @@ export function useSignaling(): {
         chunkIndex,
         data: chunkData
       });
-      await manager.sendChatMessage(peerId, message);
+      const sent = await sendChatMessageWithRetry(peerId, message);
+      if (!sent) {
+        return;
+      }
 
       const peerState = getOrCreatePeerAckState(transfer.fileId, peerId);
       peerState.sentChunkIndexes.add(chunkIndex);
@@ -1043,7 +1081,7 @@ export function useSignaling(): {
                   type: 'receipt',
                   messageId: message.id
                 });
-                await peerManagerRef.current?.sendChatMessage(peerId, receipt);
+                await sendChatMessageWithRetry(peerId, receipt);
               })();
             }
             return;
@@ -1136,7 +1174,7 @@ export function useSignaling(): {
                   fileId: payload.fileId,
                   status: 'complete'
                 });
-                await peerManagerRef.current?.sendChatMessage(peerId, ack);
+                await sendChatMessageWithRetry(peerId, ack);
               })();
               return;
             }
@@ -1150,7 +1188,7 @@ export function useSignaling(): {
                 status: 'accepted',
                 missingChunks
               });
-              await peerManagerRef.current?.sendChatMessage(peerId, ack);
+              await sendChatMessageWithRetry(peerId, ack);
             })();
             return;
           }
@@ -1217,7 +1255,7 @@ export function useSignaling(): {
                   fileId: payload.fileId,
                   status: 'complete'
                 });
-                await peerManagerRef.current?.sendChatMessage(peerId, ack);
+                await sendChatMessageWithRetry(peerId, ack);
               } catch (error) {
                 const reason = error instanceof Error ? error.message : 'Failed to assemble file.';
                 setFileTransfers((current) =>
@@ -1238,7 +1276,7 @@ export function useSignaling(): {
                   status: 'rejected',
                   reason
                 });
-                await peerManagerRef.current?.sendChatMessage(peerId, ack);
+                await sendChatMessageWithRetry(peerId, ack);
               }
             })();
             return;
@@ -1738,6 +1776,7 @@ export function useSignaling(): {
         const messageId = crypto.randomUUID();
         const timestamp = Date.now();
         const peers = manager?.getConnections().map((entry) => entry.peerId) ?? [];
+        let didSendToAnyPeer = peers.length === 0;
         for (const peerId of peers) {
           const message = await createSignedMessageForPeer(
             peerId,
@@ -1747,7 +1786,19 @@ export function useSignaling(): {
             },
             { id: messageId, timestamp }
           );
-          await manager?.sendChatMessage(peerId, message);
+          const sent = await sendChatMessageWithRetry(peerId, message);
+          if (sent) {
+            didSendToAnyPeer = true;
+            continue;
+          }
+
+          setLastError(`Chat channel is not ready for peer ${peerId.slice(0, 8)}.`);
+        }
+
+        if (!didSendToAnyPeer && peers.length > 0) {
+          setLastError(
+            'Chat channel is still initializing. Message will be retried automatically.'
+          );
         }
 
         setChatMessages((current) => [
@@ -1779,6 +1830,7 @@ export function useSignaling(): {
         const reactionId = crypto.randomUUID();
         const timestamp = Date.now();
         const peers = manager?.getConnections().map((entry) => entry.peerId) ?? [];
+        let didSendToAnyPeer = peers.length === 0;
         for (const peerId of peers) {
           const reactionMessage = await createSignedMessageForPeer(
             peerId,
@@ -1789,8 +1841,18 @@ export function useSignaling(): {
             },
             { id: reactionId, timestamp }
           );
-          await manager?.sendChatMessage(peerId, reactionMessage);
+          const sent = await sendChatMessageWithRetry(peerId, reactionMessage);
+          if (sent) {
+            didSendToAnyPeer = true;
+          } else {
+            setLastError(`Chat channel is not ready for peer ${peerId.slice(0, 8)}.`);
+          }
         }
+
+        if (!didSendToAnyPeer && peers.length > 0) {
+          setLastError('Chat channel is still initializing. Reaction delivery will retry shortly.');
+        }
+
         setChatMessages((current) =>
           current.map((entry) => {
             if (entry.id !== messageId) {

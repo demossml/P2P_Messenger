@@ -14,12 +14,17 @@ on:
         type: choice
         options:
           - smoke-only
+          - ws-strict-only
           - smoke-minimal
           - e2e-minimal
           - e2e-only
           - e2e-full-retry
           - validate-fast
           - validate-full
+          - release-readiness
+          - release-readiness-live
+          - pre-release-full
+          - pre-release-live
           - smoke-and-e2e
           - smoke-e2e-k6
 
@@ -137,7 +142,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Install Playwright browser
-        if: ${{ github.event.inputs.validation != 'smoke-only' }}
+        if: ${{ github.event.inputs.validation != 'smoke-only' && github.event.inputs.validation != 'ws-strict-only' && github.event.inputs.validation != 'release-readiness' && github.event.inputs.validation != 'release-readiness-live' && github.event.inputs.validation != 'pre-release-full' && github.event.inputs.validation != 'pre-release-live' }}
         run: pnpm exec playwright install chromium
 
       - name: Setup k6
@@ -173,23 +178,313 @@ jobs:
           curl -fsS http://127.0.0.1:5173 >/dev/null
 
       - name: Run smoke suite
-        if: ${{ github.event.inputs.validation == 'smoke-only' || github.event.inputs.validation == 'smoke-minimal' || github.event.inputs.validation == 'smoke-and-e2e' || github.event.inputs.validation == 'smoke-e2e-k6' }}
+        id: smoke_suite
+        if: ${{ github.event.inputs.validation == 'smoke-only' || github.event.inputs.validation == 'ws-strict-only' || github.event.inputs.validation == 'smoke-minimal' || github.event.inputs.validation == 'smoke-and-e2e' || github.event.inputs.validation == 'smoke-e2e-k6' }}
         run: |
-          if [ "${{ github.event.inputs.validation }}" = "smoke-minimal" ]; then
+          START_TS=$(date +%s)
+          echo "$START_TS" > /tmp/smoke_suite_start_ts
+
+          set +e
+          if [ "${{ github.event.inputs.validation }}" = "ws-strict-only" ]; then
+            pnpm smoke:ws:strict
+          elif [ "${{ github.event.inputs.validation }}" = "smoke-minimal" ]; then
             pnpm smoke:minimal:retry
           else
             pnpm smoke:all
           fi
+          STATUS=$?
+          set -e
+
+          END_TS=$(date +%s)
+          echo "$END_TS" > /tmp/smoke_suite_end_ts
+          echo "$((END_TS - START_TS))" > /tmp/smoke_suite_duration_s
+
+          exit $STATUS
+
+      - name: Render ws-strict-only summary
+        if: ${{ always() && github.event.inputs.validation == 'ws-strict-only' }}
+        run: |
+          OUTCOME="${{ steps.smoke_suite.outcome }}"
+          DURATION_S="n/a"
+          if [ -f /tmp/smoke_suite_duration_s ]; then
+            DURATION_S="$(cat /tmp/smoke_suite_duration_s)s"
+          fi
+
+          echo "### WS Strict Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Outcome | \`$OUTCOME\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Duration | \`$DURATION_S\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Pipeline | \`smoke:ws:limits -> smoke:ws:negative\` |" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$OUTCOME" != "success" ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Failure hints:" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Start local runtime: \`pnpm dev:all\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Re-run strict WS locally: \`pnpm smoke:ws:strict\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Isolate limits only: \`pnpm smoke:ws:limits\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Isolate negative only: \`pnpm smoke:ws:negative\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Verify health endpoint: \`curl -fsS http://127.0.0.1:3001/health\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Inspect uploaded runtime logs: \`/tmp/signaling.log\`, \`/tmp/client.log\`" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Render smoke-minimal summary
+        if: ${{ always() && github.event.inputs.validation == 'smoke-minimal' }}
+        run: |
+          OUTCOME="${{ steps.smoke_suite.outcome }}"
+          DURATION_S="n/a"
+          if [ -f /tmp/smoke_suite_duration_s ]; then
+            DURATION_S="$(cat /tmp/smoke_suite_duration_s)s"
+          fi
+
+          echo "### Smoke Minimal Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Outcome | \`$OUTCOME\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Duration | \`$DURATION_S\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Pipeline | \`smoke:http -> smoke:ws (retry wrapper)\` |" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$OUTCOME" != "success" ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Failure hints:" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Start local runtime: \`pnpm dev:all\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Re-run minimal smoke locally: \`pnpm smoke:minimal:retry\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Isolate HTTP only: \`pnpm smoke:http\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Isolate WS happy-path only: \`pnpm smoke:ws\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Verify health endpoint: \`curl -fsS http://127.0.0.1:3001/health\`" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Render smoke-only summary
+        if: ${{ always() && github.event.inputs.validation == 'smoke-only' }}
+        run: |
+          OUTCOME="${{ steps.smoke_suite.outcome }}"
+          DURATION_S="n/a"
+          if [ -f /tmp/smoke_suite_duration_s ]; then
+            DURATION_S="$(cat /tmp/smoke_suite_duration_s)s"
+          fi
+
+          echo "### Smoke Full Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Outcome | \`$OUTCOME\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Duration | \`$DURATION_S\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Pipeline | \`smoke:http -> smoke:ws -> smoke:ws:limits -> smoke:ws:negative\` |" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$OUTCOME" != "success" ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Failure hints:" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Start local runtime: \`pnpm dev:all\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Re-run full smoke locally: \`pnpm smoke:all\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Re-run strict WS only: \`pnpm smoke:ws:strict\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Verify health endpoint: \`curl -fsS http://127.0.0.1:3001/health\`" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Run e2e suite
+        id: e2e_suite
         if: ${{ github.event.inputs.validation == 'e2e-minimal' || github.event.inputs.validation == 'e2e-only' || github.event.inputs.validation == 'e2e-full-retry' || github.event.inputs.validation == 'smoke-and-e2e' || github.event.inputs.validation == 'smoke-e2e-k6' }}
         run: |
+          START_TS=$(date +%s)
+          echo "$START_TS" > /tmp/e2e_suite_start_ts
+
+          set +e
           if [ "${{ github.event.inputs.validation }}" = "e2e-minimal" ]; then
             pnpm e2e:minimal:retry
           elif [ "${{ github.event.inputs.validation }}" = "e2e-full-retry" ]; then
             pnpm e2e:retry
           else
             pnpm e2e
+          fi
+          STATUS=$?
+          set -e
+
+          END_TS=$(date +%s)
+          echo "$END_TS" > /tmp/e2e_suite_end_ts
+          echo "$((END_TS - START_TS))" > /tmp/e2e_suite_duration_s
+
+          exit $STATUS
+
+      - name: Render e2e-only summary
+        if: ${{ always() && (github.event.inputs.validation == 'e2e-minimal' || github.event.inputs.validation == 'e2e-only' || github.event.inputs.validation == 'e2e-full-retry') }}
+        run: |
+          OUTCOME="${{ steps.e2e_suite.outcome }}"
+          DURATION_S="n/a"
+          if [ -f /tmp/e2e_suite_duration_s ]; then
+            DURATION_S="$(cat /tmp/e2e_suite_duration_s)s"
+          fi
+
+          PIPELINE="e2e"
+          if [ "${{ github.event.inputs.validation }}" = "e2e-minimal" ]; then
+            PIPELINE="e2e:minimal:retry"
+          elif [ "${{ github.event.inputs.validation }}" = "e2e-full-retry" ]; then
+            PIPELINE="e2e:retry"
+          fi
+
+          echo "### E2E Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Outcome | \`$OUTCOME\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Duration | \`$DURATION_S\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Pipeline | \`$PIPELINE\` |" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$OUTCOME" != "success" ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Failure hints:" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Start local runtime: \`pnpm dev:all\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Re-run minimal browser flow: \`pnpm e2e:minimal:retry\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Re-run full browser flow with retry: \`pnpm e2e:retry\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Ensure browser is installed: \`pnpm exec playwright install chromium\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Inspect artifacts: \`playwright-report\`, \`test-results\`, runtime logs" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Run release readiness
+        id: release_readiness
+        if: ${{ github.event.inputs.validation == 'release-readiness' || github.event.inputs.validation == 'release-readiness-live' }}
+        run: |
+          START_TS=$(date +%s)
+          echo "$START_TS" > /tmp/release_readiness_start_ts
+
+          set +e
+          if [ "${{ github.event.inputs.validation }}" = "release-readiness-live" ] || [ "${{ github.event.inputs.validation }}" = "pre-release-live" ]; then
+            pnpm release:readiness:live
+          else
+            pnpm release:readiness
+          fi
+          STATUS=$?
+          set -e
+
+          END_TS=$(date +%s)
+          echo "$END_TS" > /tmp/release_readiness_end_ts
+          echo "$((END_TS - START_TS))" > /tmp/release_readiness_duration_s
+
+          exit $STATUS
+
+      - name: Render release-readiness summary
+        if: ${{ always() && (github.event.inputs.validation == 'release-readiness' || github.event.inputs.validation == 'release-readiness-live') }}
+        run: |
+          OUTCOME="${{ steps.release_readiness.outcome }}"
+          DURATION_S="n/a"
+          if [ -f /tmp/release_readiness_duration_s ]; then
+            DURATION_S="$(cat /tmp/release_readiness_duration_s)s"
+          fi
+
+          PIPELINE="release:readiness"
+          if [ "${{ github.event.inputs.validation }}" = "release-readiness-live" ]; then
+            PIPELINE="release:readiness:live"
+          fi
+
+          echo "### Release Readiness Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Outcome | \`$OUTCOME\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Duration | \`$DURATION_S\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Pipeline | \`$PIPELINE\` |" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$OUTCOME" != "success" ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Failure hints:" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Start local runtime: \`pnpm dev:all\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Re-run readiness locally: \`pnpm release:readiness\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Re-run live readiness locally: \`pnpm release:readiness:live\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Verify signaling health: \`curl -fsS http://127.0.0.1:3001/health\`" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Run validate-full for pre-release
+        id: validate_full_pre_release
+        if: ${{ github.event.inputs.validation == 'pre-release-full' || github.event.inputs.validation == 'pre-release-live' }}
+        run: |
+          START_TS=$(date +%s)
+          echo "$START_TS" > /tmp/validate_full_pre_release_start_ts
+
+          set +e
+          if [ "${{ github.event.inputs.validation }}" = "pre-release-live" ]; then
+            pnpm pre-release:live
+          else
+            pnpm pre-release:full
+          fi
+          STATUS=$?
+          set -e
+
+          END_TS=$(date +%s)
+          echo "$END_TS" > /tmp/validate_full_pre_release_end_ts
+          echo "$((END_TS - START_TS))" > /tmp/validate_full_pre_release_duration_s
+
+          exit $STATUS
+
+      - name: Render pre-release-full summary
+        if: ${{ always() && (github.event.inputs.validation == 'pre-release-full' || github.event.inputs.validation == 'pre-release-live') }}
+        run: |
+          OVERALL_OUTCOME="${{ steps.validate_full_pre_release.outcome }}"
+
+          VALIDATE_DURATION_S="n/a"
+          if [ -f /tmp/validate_full_pre_release_duration_s ]; then
+            VALIDATE_DURATION_S="$(cat /tmp/validate_full_pre_release_duration_s)s"
+          fi
+
+          MODE="${{ github.event.inputs.validation }}"
+          TITLE="Pre Release Full Summary"
+          PIPELINE_LABEL="release:readiness -> validate:full"
+          if [ "$MODE" = "pre-release-live" ]; then
+            TITLE="Pre Release Live Summary"
+            PIPELINE_LABEL="release:readiness:live -> validate:full"
+          fi
+
+          echo "### $TITLE" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Overall outcome | \`$OVERALL_OUTCOME\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Aggregated command | \`$PIPELINE_LABEL\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Duration | \`$VALIDATE_DURATION_S\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Pipeline | \`$PIPELINE_LABEL\` |" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$OVERALL_OUTCOME" != "success" ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Failure hints:" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Start local runtime: \`pnpm dev:all\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Re-run readiness locally: \`pnpm release:readiness\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Optional live readiness: \`pnpm release:readiness:live\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Re-run full validation: \`pnpm validate:full\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Inspect artifacts: runtime logs, Playwright report, k6 summary files (if any)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Render smoke-and-e2e summary
+        if: ${{ always() && github.event.inputs.validation == 'smoke-and-e2e' }}
+        run: |
+          SMOKE_OUTCOME="${{ steps.smoke_suite.outcome }}"
+          E2E_OUTCOME="${{ steps.e2e_suite.outcome }}"
+          OVERALL_OUTCOME="success"
+          if [ "$SMOKE_OUTCOME" != "success" ] || [ "$E2E_OUTCOME" != "success" ]; then
+            OVERALL_OUTCOME="failure"
+          fi
+
+          SMOKE_DURATION_S="n/a"
+          if [ -f /tmp/smoke_suite_duration_s ]; then
+            SMOKE_DURATION_S="$(cat /tmp/smoke_suite_duration_s)s"
+          fi
+
+          E2E_DURATION_S="n/a"
+          if [ -f /tmp/e2e_suite_duration_s ]; then
+            E2E_DURATION_S="$(cat /tmp/e2e_suite_duration_s)s"
+          fi
+
+          echo "### Smoke And E2E Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Overall outcome | \`$OVERALL_OUTCOME\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Smoke outcome | \`$SMOKE_OUTCOME\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| E2E outcome | \`$E2E_OUTCOME\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Smoke duration | \`$SMOKE_DURATION_S\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| E2E duration | \`$E2E_DURATION_S\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Pipeline | \`smoke:all -> e2e\` |" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$OVERALL_OUTCOME" != "success" ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Failure hints:" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Start local runtime: \`pnpm dev:all\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Re-run smoke only: \`pnpm smoke:all\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Re-run strict WS only: \`pnpm smoke:ws:strict\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Re-run minimal E2E first: \`pnpm e2e:minimal:retry\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Re-run full E2E with retry: \`pnpm e2e:retry\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Inspect artifacts: \`playwright-report\`, \`test-results\`, runtime logs" >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Run full validation pipeline
@@ -281,8 +576,72 @@ jobs:
           fi
 
       - name: Run k6 quick load baseline
+        id: k6_quick
         if: ${{ github.event.inputs.validation == 'smoke-e2e-k6' }}
-        run: pnpm load:k6:signaling:quick:summary
+        run: |
+          START_TS=$(date +%s)
+          echo "$START_TS" > /tmp/k6_quick_start_ts
+
+          set +e
+          pnpm load:k6:signaling:quick:summary
+          STATUS=$?
+          set -e
+
+          END_TS=$(date +%s)
+          echo "$END_TS" > /tmp/k6_quick_end_ts
+          echo "$((END_TS - START_TS))" > /tmp/k6_quick_duration_s
+
+          exit $STATUS
+
+      - name: Render smoke-e2e-k6 top-level summary
+        if: ${{ always() && github.event.inputs.validation == 'smoke-e2e-k6' }}
+        run: |
+          SMOKE_OUTCOME="${{ steps.smoke_suite.outcome }}"
+          E2E_OUTCOME="${{ steps.e2e_suite.outcome }}"
+          K6_OUTCOME="${{ steps.k6_quick.outcome }}"
+          OVERALL_OUTCOME="success"
+          if [ "$SMOKE_OUTCOME" != "success" ] || [ "$E2E_OUTCOME" != "success" ] || [ "$K6_OUTCOME" != "success" ]; then
+            OVERALL_OUTCOME="failure"
+          fi
+
+          SMOKE_DURATION_S="n/a"
+          if [ -f /tmp/smoke_suite_duration_s ]; then
+            SMOKE_DURATION_S="$(cat /tmp/smoke_suite_duration_s)s"
+          fi
+
+          E2E_DURATION_S="n/a"
+          if [ -f /tmp/e2e_suite_duration_s ]; then
+            E2E_DURATION_S="$(cat /tmp/e2e_suite_duration_s)s"
+          fi
+
+          K6_DURATION_S="n/a"
+          if [ -f /tmp/k6_quick_duration_s ]; then
+            K6_DURATION_S="$(cat /tmp/k6_quick_duration_s)s"
+          fi
+
+          echo "### Smoke E2E K6 Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Overall outcome | \`$OVERALL_OUTCOME\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Smoke outcome | \`$SMOKE_OUTCOME\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| E2E outcome | \`$E2E_OUTCOME\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| k6 outcome | \`$K6_OUTCOME\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Smoke duration | \`$SMOKE_DURATION_S\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| E2E duration | \`$E2E_DURATION_S\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| k6 duration | \`$K6_DURATION_S\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Pipeline | \`smoke:all -> e2e -> load:k6:signaling:quick:summary\` |" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$OVERALL_OUTCOME" != "success" ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Failure hints:" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Start local runtime: \`pnpm dev:all\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Re-run smoke only: \`pnpm smoke:all\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Re-run strict WS only: \`pnpm smoke:ws:strict\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Re-run minimal E2E first: \`pnpm e2e:minimal:retry\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Re-run full E2E with retry: \`pnpm e2e:retry\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Re-run k6 quick baseline: \`pnpm load:k6:signaling:quick:summary\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Inspect uploaded artifacts: Playwright report, runtime logs, and \`artifacts/k6/*.json\`" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Render k6 summary
         if: ${{ always() && github.event.inputs.validation == 'smoke-e2e-k6' }}
@@ -339,7 +698,7 @@ jobs:
           echo "- Inspect uploaded artifacts: Playwright report, runtime logs, and \`artifacts/k6/*.json\`" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload Playwright artifacts
-        if: ${{ always() && github.event.inputs.validation != 'smoke-only' }}
+        if: ${{ always() && github.event.inputs.validation != 'smoke-only' && github.event.inputs.validation != 'ws-strict-only' && github.event.inputs.validation != 'release-readiness' && github.event.inputs.validation != 'release-readiness-live' && github.event.inputs.validation != 'pre-release-full' && github.event.inputs.validation != 'pre-release-live' }}
         uses: actions/upload-artifact@v4
         with:
           name: playwright-artifacts-${{ github.run_id }}

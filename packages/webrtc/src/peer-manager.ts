@@ -18,6 +18,7 @@ type PeerContext = {
   pendingCandidates: SignaledIceCandidate[];
   remoteStream: MediaStream;
   chatChannel?: RTCDataChannel;
+  connectedNotified: boolean;
 };
 
 type SignaledIceCandidate = Extract<
@@ -125,30 +126,50 @@ export class PeerManager {
     this.peers.clear();
   }
 
-  public async sendChatMessage(peerId: string, message: ChatMessage): Promise<void> {
+  public async sendChatMessage(peerId: string, message: ChatMessage): Promise<boolean> {
     const context = this.peers.get(peerId);
-    if (!context?.chatChannel || context.chatChannel.readyState !== 'open') {
+    if (!context) {
       this.onError(new Error(`Chat channel is not open for peer ${peerId}.`));
-      return;
+      return false;
+    }
+
+    const chatChannel = await this.ensureChatChannel(peerId, context);
+    if (!chatChannel) {
+      return false;
+    }
+
+    if (chatChannel.readyState === 'connecting') {
+      const opened = await this.waitForChatChannelOpen(chatChannel, 5000);
+      if (!opened) {
+        this.onError(new Error(`Timed out waiting for chat channel open for peer ${peerId}.`));
+        return false;
+      }
+    }
+
+    if (chatChannel.readyState !== 'open') {
+      this.onError(new Error(`Chat channel is not open for peer ${peerId}.`));
+      return false;
     }
 
     const validated = chatMessageSchema.safeParse(message);
     if (!validated.success) {
       this.onError(new Error('Outgoing chat message has invalid schema.'));
-      return;
+      return false;
     }
 
     const serialized = JSON.stringify(validated.data);
     const messageSize = utf8ByteLength(serialized);
     if (messageSize > MAX_CHAT_MESSAGE_BYTES) {
       this.onError(new Error(`Outgoing chat message exceeds ${MAX_CHAT_MESSAGE_BYTES} bytes.`));
-      return;
+      return false;
     }
 
     try {
-      await this.sendWithBackpressure(context.chatChannel, serialized);
+      await this.sendWithBackpressure(chatChannel, serialized);
+      return true;
     } catch (error) {
       this.onError(error instanceof Error ? error : new Error('Failed to send chat message.'));
+      return false;
     }
   }
 
@@ -218,7 +239,8 @@ export class PeerManager {
     const context: PeerContext = {
       connection,
       pendingCandidates: [],
-      remoteStream
+      remoteStream,
+      connectedNotified: false
     };
 
     this.attachConnectionHandlers(remotePeerId, context);
@@ -232,7 +254,7 @@ export class PeerManager {
     }
     this.attachLocalTracks(connection);
     this.peers.set(remotePeerId, context);
-    this.onPeerConnected(remotePeerId);
+    this.notifyPeerConnectedIfReady(remotePeerId, context);
 
     if (createOffer) {
       await this.createAndSendOffer(remotePeerId, connection);
@@ -281,6 +303,7 @@ export class PeerManager {
 
       context.chatChannel = event.channel;
       this.attachChatChannelHandlers(remotePeerId, event.channel);
+      this.notifyPeerConnectedIfReady(remotePeerId, context);
     };
   }
 
@@ -477,6 +500,15 @@ export class PeerManager {
   private attachChatChannelHandlers(peerId: string, channel: RTCDataChannel): void {
     channel.bufferedAmountLowThreshold = 256 * 1024;
 
+    channel.onopen = () => {
+      const context = this.peers.get(peerId);
+      if (!context) {
+        return;
+      }
+
+      this.notifyPeerConnectedIfReady(peerId, context);
+    };
+
     channel.onmessage = (event) => {
       if (typeof event.data !== 'string') {
         this.onError(new Error('Incoming chat message must be text JSON.'));
@@ -509,6 +541,28 @@ export class PeerManager {
     channel.onerror = () => {
       this.onError(new Error(`Chat channel error for peer ${peerId}.`));
     };
+
+    channel.onclose = () => {
+      this.closePeer(peerId);
+    };
+
+    const context = this.peers.get(peerId);
+    if (context) {
+      this.notifyPeerConnectedIfReady(peerId, context);
+    }
+  }
+
+  private notifyPeerConnectedIfReady(peerId: string, context: PeerContext): void {
+    if (context.connectedNotified) {
+      return;
+    }
+
+    if (!context.chatChannel || context.chatChannel.readyState !== 'open') {
+      return;
+    }
+
+    context.connectedNotified = true;
+    this.onPeerConnected(peerId);
   }
 
   private async sendWithBackpressure(channel: RTCDataChannel, payload: string): Promise<void> {
@@ -530,5 +584,71 @@ export class PeerManager {
     }
 
     channel.send(payload);
+  }
+
+  private async ensureChatChannel(
+    peerId: string,
+    context: PeerContext
+  ): Promise<RTCDataChannel | null> {
+    if (context.chatChannel && context.chatChannel.readyState !== 'closed') {
+      return context.chatChannel;
+    }
+
+    try {
+      const channel = context.connection.createDataChannel('chat', {
+        ordered: true,
+        protocol: 'v1'
+      });
+      context.chatChannel = channel;
+      this.attachChatChannelHandlers(peerId, channel);
+      this.notifyPeerConnectedIfReady(peerId, context);
+      await this.restartIce(peerId, context.connection);
+      return channel;
+    } catch (error) {
+      this.onError(
+        error instanceof Error ? error : new Error('Failed to initialize chat channel.')
+      );
+      return null;
+    }
+  }
+
+  private async waitForChatChannelOpen(
+    channel: RTCDataChannel,
+    timeoutMs: number
+  ): Promise<boolean> {
+    if (channel.readyState === 'open') {
+      return true;
+    }
+
+    if (channel.readyState !== 'connecting') {
+      return false;
+    }
+
+    return await new Promise<boolean>((resolve) => {
+      const timeoutId = window.setTimeout(() => {
+        channel.removeEventListener('open', onOpen);
+        channel.removeEventListener('close', onClose);
+        resolve(false);
+      }, timeoutMs);
+
+      const clear = () => {
+        window.clearTimeout(timeoutId);
+        channel.removeEventListener('open', onOpen);
+        channel.removeEventListener('close', onClose);
+      };
+
+      const onOpen = () => {
+        clear();
+        resolve(true);
+      };
+
+      const onClose = () => {
+        clear();
+        resolve(false);
+      };
+
+      channel.addEventListener('open', onOpen, { once: true });
+      channel.addEventListener('close', onClose, { once: true });
+    });
   }
 }

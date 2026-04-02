@@ -49,6 +49,7 @@ Use this quick guide to pick the right validation scope:
 | Quick API + signaling sanity check                   | `pnpm smoke:minimal`       | Runs HTTP + WS happy-path only.                                              |
 | Quick API + signaling sanity with startup resilience | `pnpm smoke:minimal:retry` | Retries on transient startup/network hiccups.                                |
 | Full signaling smoke coverage                        | `pnpm smoke:all`           | Includes negative-path checks (`INVALID_JSON`, rate-limit, room full, etc.). |
+| Strict WS-only validation                            | `pnpm smoke:ws:strict`     | Runs WS schema limits + WS negative checks (without HTTP smoke).             |
 | Quick browser E2E sanity                             | `pnpm e2e:minimal`         | Minimal Playwright flow: `join -> text -> read receipt`.                     |
 | Quick browser E2E with resilience                    | `pnpm e2e:minimal:retry`   | Retries minimal Playwright flow.                                             |
 | Full browser E2E                                     | `pnpm e2e`                 | Runs all Playwright scenarios.                                               |
@@ -72,6 +73,9 @@ Use these presets depending on delivery stage:
    - `pnpm release:readiness`
    - optional live readiness check: `pnpm release:readiness:live`
    - `pnpm validate:full`
+   - one-command alternatives:
+     - `pnpm pre-release:full`
+     - `pnpm pre-release:live`
    - optional load check: `pnpm load:k6:signaling:quick:summary`
 
 For a formal go/no-go flow, use [RELEASE_CHECKLIST.md](/Users/dmitrijsuvalov/Documents/P2P_Messenger/RELEASE_CHECKLIST.md).
@@ -104,7 +108,10 @@ You can still run checks separately if needed:
 
 - `pnpm smoke:http`
 - `pnpm smoke:ws`
+- `pnpm smoke:ws:limits` (fast schema-limit checks for oversized `join.peerPublicKey`, `offer.sdp`, `ice-candidate.candidate`)
+- `pnpm smoke:ws:strict` (runs `smoke:ws:limits` + `smoke:ws:negative`)
 - `pnpm smoke:ws:negative` (checks invalid `Origin` rejection, `INVALID_JSON`, `SCHEMA_VALIDATION_FAILED`, `RATE_LIMITED`, `ROOM_IS_FULL` paths)
+- also checks oversized signaling schema payloads (`join.peerPublicKey`, `offer.sdp`, `ice-candidate.candidate`) are rejected with `SCHEMA_VALIDATION_FAILED`
 - also checks malformed `peerPublicKey` bundle marker does not crash signaling flow (backward/robustness scenario)
 
 ## Load baseline (k6)
@@ -155,16 +162,31 @@ Manual pre-release validation:
 
 - `.github/workflows/ci.yml` also supports `workflow_dispatch` with:
   - `smoke-only`
+  - `ws-strict-only`
   - `smoke-minimal`
   - `e2e-minimal`
   - `e2e-only`
   - `e2e-full-retry`
   - `validate-fast`
   - `validate-full`
+  - `release-readiness`
+  - `release-readiness-live`
+  - `pre-release-full`
+  - `pre-release-live`
   - `smoke-and-e2e`
   - `smoke-e2e-k6`
 - Starts local signaling + client runtime in CI, runs selected suites, and uploads logs/test artifacts.
 - `smoke-minimal` runs only `smoke:http` + `smoke:ws` (without negative-path suite).
+- `ws-strict-only` runs strict WS checks only (`smoke:ws:strict` = `smoke:ws:limits` + `smoke:ws:negative`), without HTTP smoke and without Playwright.
+- `ws-strict-only` writes a compact `WS Strict Summary` table (`outcome`, `duration`, `pipeline`) to GitHub Step Summary.
+- `smoke-minimal` writes a compact `Smoke Minimal Summary` table (`outcome`, `duration`, `pipeline`) to GitHub Step Summary.
+- `smoke-only` writes a compact `Smoke Full Summary` table (`outcome`, `duration`, `pipeline`) to GitHub Step Summary.
+- `smoke-and-e2e` writes a compact `Smoke And E2E Summary` table (overall/smoke/e2e outcomes + durations + pipeline) to GitHub Step Summary.
+- `e2e-minimal`, `e2e-only`, and `e2e-full-retry` write a compact `E2E Summary` table (`outcome`, `duration`, `pipeline`) to GitHub Step Summary.
+- `smoke-e2e-k6` writes a top-level `Smoke E2E K6 Summary` table (overall/smoke/e2e/k6 outcomes + durations + pipeline) to GitHub Step Summary.
+- `release-readiness` and `release-readiness-live` write a compact `Release Readiness Summary` table (`outcome`, `duration`, `pipeline`) to GitHub Step Summary.
+- `pre-release-full` runs `release:readiness -> validate:full` and writes a top-level `Pre Release Full Summary` table (overall/readiness/validate outcomes + durations + pipeline) to GitHub Step Summary.
+- `pre-release-live` runs `release:readiness:live -> validate:full` and writes a top-level `Pre Release Live Summary` table (overall/readiness/validate outcomes + durations + pipeline) to GitHub Step Summary.
 - `smoke-minimal` in CI uses `smoke:minimal:retry` (`3` attempts, `1500ms` delay by default).
 - Retry knobs:
   - `P2P_SMOKE_RETRY_ATTEMPTS` (default `3`)
