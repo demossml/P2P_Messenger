@@ -11,11 +11,22 @@ export default [
   js.configs.recommended,
   ...tseslint.configs.recommended,
   {
+    files: ['**/*.{js,mjs,cjs}'],
+    languageOptions: {
+      globals: {
+        ...globals.node,
+        ...globals.browser
+      }
+    }
+  },
+  {
     files: ['**/*.{ts,tsx,mts,cts}'],
     languageOptions: {
       parser: tseslint.parser,
       parserOptions: {
-        projectService: true,
+        projectService: {
+          allowDefaultProject: ['*.ts', 'tests/*/*.ts', 'apps/*/vite.config.ts']
+        },
         tsconfigRootDir: import.meta.dirname
       },
       globals: {
@@ -29,7 +40,15 @@ export default [
     },
     rules: {
       'unicorn/prevent-abbreviations': 'off',
-      'unicorn/no-null': 'off'
+      'unicorn/no-null': 'off',
+      '@typescript-eslint/no-unused-vars': [
+        'error',
+        {
+          argsIgnorePattern: '^_',
+          varsIgnorePattern: '^_',
+          caughtErrorsIgnorePattern: '^_'
+        }
+      ]
     }
   }
 ];

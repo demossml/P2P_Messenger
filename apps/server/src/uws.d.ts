@@ -7,6 +7,7 @@ declare module 'uWebSockets.js' {
 
   export type HttpResponse = {
     writeStatus(status: string): HttpResponse;
+    writeHeader(name: string, value: string): HttpResponse;
     end(message?: string): void;
     onAborted(handler: () => void): void;
     upgrade<UserData>(
@@ -21,7 +22,7 @@ declare module 'uWebSockets.js' {
   export type WebSocket<UserData> = {
     getUserData(): UserData;
     send(message: string): void;
-    close(): void;
+    close(code?: number, shortMessage?: string): void;
   };
 
   export type WebSocketBehavior<UserData> = {
@@ -36,6 +37,10 @@ declare module 'uWebSockets.js' {
 
   export type TemplatedApp = {
     ws<UserData>(pattern: string, behavior: WebSocketBehavior<UserData>): TemplatedApp;
+    options(
+      pattern: string,
+      handler: (response: HttpResponse, request: HttpRequest) => void
+    ): TemplatedApp;
     get(
       pattern: string,
       handler: (response: HttpResponse, request: HttpRequest) => void

@@ -3,6 +3,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { SignalingTransport } from './signaling-transport.js';
 
+const MAX_SIGNALING_MESSAGE_BYTES = 8 * 1024;
+
 type Listener = (event?: unknown) => void;
 
 class FakeWebSocket {
@@ -46,6 +48,10 @@ class FakeWebSocket {
   public emitClose(): void {
     this.readyState = FakeWebSocket.CLOSED;
     this.emit('close');
+  }
+
+  public emitMessage(data: unknown): void {
+    this.emit('message', { data });
   }
 
   private emit(type: string, event?: unknown): void {
@@ -102,6 +108,32 @@ describe('SignalingTransport', () => {
       peerId: '11111111-1111-4111-8111-111111111111',
       token: 'token-abc',
       peerPublicKey: 'peer-public-key'
+    });
+  });
+
+  it('reconnects from stored room id and sends join', async () => {
+    sessionStorage.setItem('p2p.roomId', 'room-restored');
+    const getToken = vi.fn(async () => 'token-restored');
+    const transport = new SignalingTransport({
+      url: 'ws://localhost:3001/ws',
+      peerId: '12121212-1212-4121-8121-121212121212',
+      peerPublicKey: 'peer-public-key',
+      getToken
+    });
+
+    const didReconnect = transport.reconnectFromSession();
+    expect(didReconnect).toBe(true);
+
+    const socket = getLastSocket();
+    socket.emitOpen();
+    await Promise.resolve();
+
+    expect(getToken).toHaveBeenCalledTimes(1);
+    expect(socket.sent).toHaveLength(1);
+    expect(JSON.parse(socket.sent[0] as string)).toMatchObject({
+      type: 'join',
+      roomId: 'room-restored',
+      peerId: '12121212-1212-4121-8121-121212121212'
     });
   });
 
@@ -190,5 +222,114 @@ describe('SignalingTransport', () => {
 
     expect(FakeWebSocket.instances).toHaveLength(2);
     expect(onStatus).not.toHaveBeenCalledWith('reconnecting');
+  });
+
+  it('rejects oversized signaling payload before JSON parsing', () => {
+    const onError = vi.fn();
+    const onMessage = vi.fn();
+    const transport = new SignalingTransport({
+      url: 'ws://localhost:3001/ws',
+      peerId: '55555555-5555-4555-8555-555555555555',
+      peerPublicKey: 'peer-public-key',
+      getToken: async () => 'token',
+      onError,
+      onMessage
+    });
+
+    transport.connect('room-oversized');
+    const socket = getLastSocket();
+    socket.emitOpen();
+    socket.emitMessage(
+      JSON.stringify({
+        type: 'error',
+        code: 'oversized-test',
+        message: 'x'.repeat(MAX_SIGNALING_MESSAGE_BYTES + 256)
+      })
+    );
+
+    expect(onMessage).not.toHaveBeenCalled();
+    expect(onError).toHaveBeenCalled();
+  });
+
+  it('clears stored room id on leave', () => {
+    const transport = new SignalingTransport({
+      url: 'ws://localhost:3001/ws',
+      peerId: '56565656-5656-4565-8565-565656565656',
+      peerPublicKey: 'peer-public-key',
+      getToken: async () => 'token'
+    });
+
+    transport.connect('room-leave');
+    expect(sessionStorage.getItem('p2p.roomId')).toBe('room-leave');
+
+    transport.leave();
+    expect(sessionStorage.getItem('p2p.roomId')).toBeNull();
+  });
+
+  it('refuses to send oversized outbound relay message', async () => {
+    const onError = vi.fn();
+    const transport = new SignalingTransport({
+      url: 'ws://localhost:3001/ws',
+      peerId: '67676767-6767-4676-8676-676767676767',
+      peerPublicKey: 'peer-public-key',
+      getToken: async () => 'token',
+      onError
+    });
+
+    transport.connect('room-outbound-size');
+    const socket = getLastSocket();
+    socket.emitOpen();
+    await Promise.resolve();
+
+    transport.send({
+      type: 'offer',
+      to: '78787878-7878-4787-8787-787878787878',
+      sdp: {
+        type: 'offer',
+        sdp: 'x'.repeat(MAX_SIGNALING_MESSAGE_BYTES + 256)
+      }
+    });
+
+    expect(socket.sent).toHaveLength(1); // join only
+    const errorMessages = onError.mock.calls.map(([error]) =>
+      error instanceof Error ? error.message : String(error)
+    );
+    expect(
+      errorMessages.some((message) =>
+        message.includes(
+          `Refusing to send signaling payload larger than ${MAX_SIGNALING_MESSAGE_BYTES} bytes.`
+        )
+      )
+    ).toBe(true);
+  });
+
+  it('refuses oversized join payload and reports send error', async () => {
+    const onError = vi.fn();
+    const getToken = vi.fn(async () => 'token');
+    const transport = new SignalingTransport({
+      url: 'ws://localhost:3001/ws',
+      peerId: '79797979-7979-4797-8797-797979797979',
+      peerPublicKey: 'k'.repeat(MAX_SIGNALING_MESSAGE_BYTES + 256),
+      getToken,
+      onError
+    });
+
+    transport.connect('room-join-too-large');
+    const socket = getLastSocket();
+    socket.emitOpen();
+    await Promise.resolve();
+
+    expect(getToken).toHaveBeenCalledTimes(1);
+    expect(socket.sent).toHaveLength(0);
+    const errorMessages = onError.mock.calls.map(([error]) =>
+      error instanceof Error ? error.message : String(error)
+    );
+    expect(
+      errorMessages.some((message) =>
+        message.includes(
+          `Refusing to send signaling payload larger than ${MAX_SIGNALING_MESSAGE_BYTES} bytes.`
+        )
+      )
+    ).toBe(true);
   });
 });

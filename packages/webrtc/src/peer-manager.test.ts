@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { PeerManager } from './peer-manager.js';
 
+const MAX_CHAT_MESSAGE_BYTES = 256 * 1024;
+
 type SentMessage = {
   type: 'offer' | 'answer' | 'ice-candidate';
   to: string;
@@ -62,7 +64,8 @@ class FakeRTCPeerConnection {
   public static readonly instances: FakeRTCPeerConnection[] = [];
 
   public onicecandidate: ((event: { candidate: RTCIceCandidate | null }) => void) | null = null;
-  public ontrack: ((event: { track: MediaStreamTrack; streams: MediaStream[] }) => void) | null = null;
+  public ontrack: ((event: { track: MediaStreamTrack; streams: MediaStream[] }) => void) | null =
+    null;
   public onconnectionstatechange: (() => void) | null = null;
   public ondatachannel: ((event: { channel: RTCDataChannel }) => void) | null = null;
 
@@ -135,7 +138,10 @@ class FakeRTCPeerConnection {
 describe('PeerManager', () => {
   beforeEach(() => {
     FakeRTCPeerConnection.instances.length = 0;
-    vi.stubGlobal('RTCPeerConnection', FakeRTCPeerConnection as unknown as typeof RTCPeerConnection);
+    vi.stubGlobal(
+      'RTCPeerConnection',
+      FakeRTCPeerConnection as unknown as typeof RTCPeerConnection
+    );
     vi.stubGlobal('MediaStream', FakeMediaStream as unknown as typeof MediaStream);
     vi.stubGlobal('window', globalThis);
   });
@@ -188,7 +194,8 @@ describe('PeerManager', () => {
       }
     });
 
-    const connectionBeforeOffer = manager.getConnections()[0]?.connection as unknown as FakeRTCPeerConnection;
+    const connectionBeforeOffer = manager.getConnections()[0]
+      ?.connection as unknown as FakeRTCPeerConnection;
     expect(connectionBeforeOffer.addedCandidates).toHaveLength(0);
 
     await manager.handleSignalingMessage({
@@ -245,5 +252,49 @@ describe('PeerManager', () => {
       to: 'peer-a',
       sdp: { type: 'offer', sdp: 'fake-offer-sdp' }
     });
+  });
+
+  it('rejects oversized chat payload before JSON parsing', async () => {
+    const onError = vi.fn();
+    const onChatMessage = vi.fn();
+    const manager = new PeerManager({
+      localPeerId: 'peer-a',
+      transport: {
+        send: () => undefined
+      } as never,
+      onError,
+      onChatMessage
+    });
+
+    await manager.handleSignalingMessage({
+      type: 'offer',
+      from: 'peer-b',
+      sdp: { type: 'offer', sdp: 'remote-offer' }
+    });
+
+    const connection = manager.getConnections()[0]?.connection as unknown as FakeRTCPeerConnection;
+    const channel = new FakeDataChannel('chat', 'v1');
+    connection.ondatachannel?.({ channel: channel as unknown as RTCDataChannel });
+    const missingChunks = Array.from({ length: 70_000 }, (_, index) => index);
+    const oversizedButValidMessage = JSON.stringify({
+      id: '12345678-1234-4123-8123-123456789012',
+      timestamp: Date.now(),
+      senderId: '87654321-4321-4876-8876-210987654321',
+      signature: 'sig',
+      payload: {
+        type: 'file-ack',
+        fileId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+        status: 'accepted',
+        missingChunks
+      }
+    });
+
+    channel.onmessage?.({
+      data: oversizedButValidMessage
+    } as MessageEvent<string>);
+
+    expect(onChatMessage).not.toHaveBeenCalled();
+    expect(onError).toHaveBeenCalled();
+    expect(oversizedButValidMessage.length).toBeGreaterThan(MAX_CHAT_MESSAGE_BYTES);
   });
 });

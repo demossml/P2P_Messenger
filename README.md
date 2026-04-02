@@ -3,6 +3,7 @@
 Monorepo bootstrap for P2P Messenger.
 
 ## Stack
+
 - pnpm workspaces
 - Turborepo
 - TypeScript strict mode
@@ -10,6 +11,7 @@ Monorepo bootstrap for P2P Messenger.
 - Husky + lint-staged + commitlint
 
 ## Quick start
+
 1. Copy environment:
    - `cp .env.example .env`
 2. Put valid RSA keys into `.env`:
@@ -21,6 +23,7 @@ Monorepo bootstrap for P2P Messenger.
    - `docker compose up`
 
 ## Minimal local run
+
 1. Install dependencies:
    - `pnpm install`
 2. One-command start:
@@ -31,16 +34,56 @@ Monorepo bootstrap for P2P Messenger.
 `dev:setup` is safe to run multiple times: it keeps existing non-placeholder values and only generates missing placeholders (`JWT_PRIVATE_KEY`, `JWT_PUBLIC_KEY`, `TURN_SECRET`).
 
 Manual split mode (if needed):
+
 - `pnpm dev:setup`
 - `pnpm dev:infra`
 - `pnpm dev:server`
 - `pnpm dev:client`
 
+## Validation matrix
+
+Use this quick guide to pick the right validation scope:
+
+| Goal                                                 | Fastest command            | Notes                                                                        |
+| ---------------------------------------------------- | -------------------------- | ---------------------------------------------------------------------------- |
+| Quick API + signaling sanity check                   | `pnpm smoke:minimal`       | Runs HTTP + WS happy-path only.                                              |
+| Quick API + signaling sanity with startup resilience | `pnpm smoke:minimal:retry` | Retries on transient startup/network hiccups.                                |
+| Full signaling smoke coverage                        | `pnpm smoke:all`           | Includes negative-path checks (`INVALID_JSON`, rate-limit, room full, etc.). |
+| Quick browser E2E sanity                             | `pnpm e2e:minimal`         | Minimal Playwright flow: `join -> text -> read receipt`.                     |
+| Quick browser E2E with resilience                    | `pnpm e2e:minimal:retry`   | Retries minimal Playwright flow.                                             |
+| Full browser E2E                                     | `pnpm e2e`                 | Runs all Playwright scenarios.                                               |
+| Full browser E2E with resilience                     | `pnpm e2e:retry`           | Retries full Playwright suite.                                               |
+| One-command fast validation                          | `pnpm validate:fast`       | Runs `smoke:minimal:retry` then `e2e:minimal:retry`.                         |
+| One-command full validation                          | `pnpm validate:full`       | Runs `smoke:all`, `e2e:retry`, `lint`, `typecheck`.                          |
+
+## Recommended sequences
+
+Use these presets depending on delivery stage:
+
+1. Before commit (quick feedback loop):
+   - `pnpm lint`
+   - `pnpm validate:fast`
+
+2. Before push to shared branch:
+   - `pnpm validate:fast`
+   - `pnpm test`
+
+3. Before release / production deploy:
+   - `pnpm release:readiness`
+   - optional live readiness check: `pnpm release:readiness:live`
+   - `pnpm validate:full`
+   - optional load check: `pnpm load:k6:signaling:quick:summary`
+
+For a formal go/no-go flow, use [RELEASE_CHECKLIST.md](/Users/dmitrijsuvalov/Documents/P2P_Messenger/RELEASE_CHECKLIST.md).
+
 ## Smoke check (local)
+
 1. Start app locally:
    - `pnpm dev:all`
 2. In a new terminal, run all automated smoke checks:
    - `pnpm smoke:all`
+   - quick baseline only (HTTP + WS happy-path): `pnpm smoke:minimal`
+   - quick baseline with auto-retry (useful on cold start): `pnpm smoke:minimal:retry`
 3. Open two browser tabs:
    - `http://localhost:5173`
    - `http://localhost:5173`
@@ -58,41 +101,49 @@ Manual split mode (if needed):
    - Start/stop screen share and verify stream switches without reconnect
 
 You can still run checks separately if needed:
+
 - `pnpm smoke:http`
 - `pnpm smoke:ws`
 - `pnpm smoke:ws:negative` (checks invalid `Origin` rejection, `INVALID_JSON`, `SCHEMA_VALIDATION_FAILED`, `RATE_LIMITED`, `ROOM_IS_FULL` paths)
+- also checks malformed `peerPublicKey` bundle marker does not crash signaling flow (backward/robustness scenario)
 
 ## Load baseline (k6)
+
 Run baseline signaling load test:
+
 - `pnpm load:k6:signaling`
 - Quick local baseline:
   - `pnpm load:k6:signaling:quick`
- - Quick baseline + JSON summary export:
-   - `pnpm load:k6:signaling:quick:summary`
- - Stress profile (higher concurrency, relaxed thresholds):
-   - `pnpm load:k6:signaling:stress`
- - Stress profile + JSON summary export:
-   - `pnpm load:k6:signaling:stress:summary`
- - Compare two summary files:
-   - `pnpm load:k6:compare -- artifacts/k6/base.json artifacts/k6/candidate.json`
-   - Compared metrics: `http_req_failed`, `ws_upgrade_success_rate`, `ws_connecting p95`, `signaling_session_ms p95`
-   - Compare runs of the same profile (`quick` vs `quick`, `stress` vs `stress`) to avoid false regressions from different load levels.
+- Quick baseline + JSON summary export:
+  - `pnpm load:k6:signaling:quick:summary`
+- Stress profile (higher concurrency, relaxed thresholds):
+  - `pnpm load:k6:signaling:stress`
+- Stress profile + JSON summary export:
+  - `pnpm load:k6:signaling:stress:summary`
+- Compare two summary files:
+  - `pnpm load:k6:compare -- artifacts/k6/base.json artifacts/k6/candidate.json`
+  - Compared metrics: `http_req_failed`, `ws_upgrade_success_rate`, `ws_connecting p95`, `signaling_session_ms p95`
+  - Compare runs of the same profile (`quick` vs `quick`, `stress` vs `stress`) to avoid false regressions from different load levels.
 
 What it does:
+
 - HTTP: requests `/auth/dev-login` per VU iteration
 - WebSocket: opens signaling socket, sends `join`, short hold, then `leave` and close
 - Uses ramping VUs (default: `20 -> 40 -> 0`)
 
 Useful env overrides:
+
 - `K6_VUS_1`, `K6_VUS_2`, `K6_STAGE_1`, `K6_STAGE_2`, `K6_STAGE_3`
 - `K6_ROOM_POOL_SIZE`, `K6_JOIN_HOLD_MS`, `K6_THINK_TIME_SECONDS`
 - `K6_SIGNALING_CONNECT_P95_MS` (default threshold target: `50ms` for `ws_connecting`)
 - `K6_SIGNALING_SESSION_P95_MS` (default threshold target: `400ms` for full join/hold/leave session)
 
 If `k6` is missing:
+
 - `brew install k6`
 
 CI load workflow:
+
 - `.github/workflows/k6-signaling.yml`
 - Supports manual run (`quick`/`stress`) and nightly quick run.
 - Uploads summary artifact `k6-signaling-<profile>-summary`.
@@ -101,26 +152,60 @@ CI load workflow:
 - Publishes a baseline-vs-current trend table (`improved` / `regressed` / `stable`) in `GitHub Step Summary`.
 
 Manual pre-release validation:
+
 - `.github/workflows/ci.yml` also supports `workflow_dispatch` with:
   - `smoke-only`
+  - `smoke-minimal`
+  - `e2e-minimal`
   - `e2e-only`
+  - `e2e-full-retry`
+  - `validate-fast`
+  - `validate-full`
   - `smoke-and-e2e`
   - `smoke-e2e-k6`
 - Starts local signaling + client runtime in CI, runs selected suites, and uploads logs/test artifacts.
+- `smoke-minimal` runs only `smoke:http` + `smoke:ws` (without negative-path suite).
+- `smoke-minimal` in CI uses `smoke:minimal:retry` (`3` attempts, `1500ms` delay by default).
+- Retry knobs:
+  - `P2P_SMOKE_RETRY_ATTEMPTS` (default `3`)
+  - `P2P_SMOKE_RETRY_DELAY_MS` (default `1500`)
+- `e2e-minimal` runs only the fast Playwright `@minimal` flow (`join -> text -> read receipt`).
+- `e2e-minimal` in CI uses `e2e:minimal:retry` (`2` attempts, `2000ms` delay by default).
+- E2E retry knobs:
+  - `P2P_E2E_RETRY_ATTEMPTS` (default `2`)
+  - `P2P_E2E_RETRY_DELAY_MS` (default `2000`)
+- `e2e-full-retry` runs full Playwright suite via `e2e:retry` (`2` attempts, `3000ms` delay by default).
+- Full E2E retry knobs:
+  - `P2P_E2E_FULL_RETRY_ATTEMPTS` (default `2`)
+  - `P2P_E2E_FULL_RETRY_DELAY_MS` (default `3000`)
+- `validate-fast` runs the aggregated pipeline `validate:fast` (`smoke:minimal:retry` -> `e2e:minimal:retry`).
+- `validate-full` runs the aggregated pipeline `validate:full` (`smoke:all` -> `e2e:retry` -> `lint` -> `typecheck`).
 - `smoke-e2e-k6` also runs `load:k6:signaling:quick:summary` and uploads `artifacts/k6/*.json`.
 - `smoke-e2e-k6` writes key k6 metrics into `GitHub Step Summary`.
 - `smoke-e2e-k6` also fetches the latest successful quick baseline artifact, runs compare, and renders trend table in `GitHub Step Summary`.
 
 ## E2E smoke (Playwright)
+
 1. Install Playwright browser once:
    - `pnpm exec playwright install chromium`
 2. Run e2e smoke test:
    - `pnpm e2e`
+   - full suite with auto-retry: `pnpm e2e:retry`
+   - quick minimal flow only: `pnpm e2e:minimal`
+   - quick minimal flow with auto-retry: `pnpm e2e:minimal:retry`
 3. If app/infra is already running and you want to skip Playwright managed webServer:
    - `pnpm e2e:local`
+   - quick minimal flow with existing local runtime: `pnpm e2e:minimal:local`
    - (uses `PW_USE_MANAGED_WEBSERVER=0`)
 
 Current e2e scenario:
+
+- Minimal fast path (`@minimal`):
+  - room id is persisted in UI across page reload (`sessionStorage`)
+  - two tabs join one room
+  - sender sends one text message
+  - receiver gets the message
+  - sender receives read receipt (`sent` -> `read`)
 - Opens two tabs
 - Joins both tabs into one room
 - Verifies both peers become visible (`Remote peers: 1`)
@@ -135,11 +220,13 @@ Current e2e scenario:
 - Verifies security fingerprint flow (`unverified` → `matched` → `unmatched` → `unverified`)
 
 ## Dev auth flow
+
 - `GET /auth/dev-login?userId=demo-user` returns `{ accessToken, refreshToken }` (disabled in production mode).
 - `GET /auth/refresh?token=<refreshToken>` rotates refresh token and returns a new pair.
 - `GET /turn-credentials` requires `Authorization: Bearer <accessToken>`.
 
 ## Implemented now
+
 - DataChannel chat/file messages are signed with an ECDSA P-256 identity key.
 - Peer key exchange now uses a backward-compatible signaling key bundle (`signing + ECDH` public keys in `peerPublicKey`), while legacy signing-only peers still work.
 - DataChannel payloads now support an encrypted envelope (`payload.type = encrypted`) with per-peer AES-256-GCM keys derived via ECDH.
@@ -188,10 +275,13 @@ Current e2e scenario:
 - `RoomManager.joinRoom` now uses an atomic Redis Lua script to enforce room capacity under concurrent joins and still allow same-peer rejoin/update.
 - Signaling rate limiting now uses a Redis-backed token bucket (leaky-bucket behavior) instead of a fixed per-second counter.
 - Signaling join flow now safely handles same-socket rejoin with a different `peerId` (old peer session is left first), preventing stale peer-id mappings.
+- Client now keeps `roomId` in `sessionStorage` in sync with UI state, so page refresh restores the room field and reconnect flow consistently.
+- Room `sessionStorage` handling is extracted into a dedicated client utility with unit tests (`read/write/trim/clear + storage-failure safety`).
 - `@p2p/server` also has `AuthService` tests for refresh rotation, token reuse detection, and family revoke behavior.
 - `@p2p/shared` has schema contract tests for signaling/chat Zod parsers.
 - `@p2p/shared` schema tests include encrypted payload boundary checks (`ivBase64`/`ciphertextBase64` limits and invalid field types).
 - Signaling contract tests explicitly cover `join.peerPublicKey` in both legacy string form and `p2p-key-bundle-v1:<base64-json>` form.
+- `peerPublicKey` signaling payload is bounded (`1..4096` chars) and oversized join/broadcast payloads are rejected by schema validation.
 - `@p2p/webrtc` has tested utilities for adaptive bitrate (`setVideoBitrate`) and connection-quality assessment (`assessConnectionQuality` for packet loss/RTT/jitter).
 - `SignalingTransport` reconnect logic is hardened and covered by unit tests:
   - exponential backoff exhaustion path
@@ -224,6 +314,7 @@ Current e2e scenario:
 - `@p2p/crypto` now has unit tests for sign/verify, signing key serialization roundtrip, ECDH shared-key derivation, and ECDH key export/import roundtrip.
 
 ## Workspace layout
+
 - `apps/client` - React client
 - `apps/server` - signaling/auth service
 - `apps/turn` - coturn configuration
@@ -231,4 +322,5 @@ Current e2e scenario:
 - `packages/crypto` - crypto primitives
 - `packages/webrtc` - WebRTC core logic
 - `packages/ui` - reusable UI components
+
 # P2P_Messenger

@@ -1,9 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import {
-  chatMessageSchema,
-  signalingInboundSchema,
-  signalingOutboundSchema
-} from './index.js';
+import { chatMessageSchema, signalingInboundSchema, signalingOutboundSchema } from './index.js';
 
 describe('signalingInboundSchema', () => {
   it('parses valid join message', () => {
@@ -36,6 +32,9 @@ describe('signalingInboundSchema', () => {
     });
 
     expect(message.type).toBe('join');
+    if (message.type !== 'join') {
+      throw new Error('Expected join message.');
+    }
     expect(message.peerPublicKey.startsWith('p2p-key-bundle-v1:')).toBe(true);
   });
 
@@ -51,6 +50,18 @@ describe('signalingInboundSchema', () => {
 
     expect(parsed.success).toBe(false);
   });
+
+  it('rejects join with oversized peerPublicKey', () => {
+    const parsed = signalingInboundSchema.safeParse({
+      type: 'join',
+      roomId: 'team-room-oversized-key',
+      peerId: '13131313-1313-4131-8131-131313131313',
+      token: '1234567890abcdef',
+      peerPublicKey: 'x'.repeat(4097)
+    });
+
+    expect(parsed.success).toBe(false);
+  });
 });
 
 describe('signalingOutboundSchema', () => {
@@ -62,6 +73,16 @@ describe('signalingOutboundSchema', () => {
     });
 
     expect(message.type).toBe('peer-joined');
+  });
+
+  it('rejects peer-joined with oversized peerPublicKey', () => {
+    const parsed = signalingOutboundSchema.safeParse({
+      type: 'peer-joined',
+      peerId: '11111111-1111-4111-8111-111111111111',
+      peerPublicKey: 'x'.repeat(4097)
+    });
+
+    expect(parsed.success).toBe(false);
   });
 });
 

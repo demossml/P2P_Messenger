@@ -5,10 +5,22 @@ import {
 } from '@p2p/shared';
 
 const RECONNECT_BACKOFF_MS = [1000, 2000, 4000, 8000, 16000] as const;
+const MAX_SIGNALING_MESSAGE_BYTES = 8 * 1024;
+
+function utf8ByteLength(value: string): number {
+  if (typeof TextEncoder !== 'undefined') {
+    return new TextEncoder().encode(value).byteLength;
+  }
+
+  return value.length;
+}
 
 type ConnectionStatus = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'closed';
 
-type RelayMessage = Extract<SignalingInboundMessage, { type: 'offer' | 'answer' | 'ice-candidate' }>;
+type RelayMessage = Extract<
+  SignalingInboundMessage,
+  { type: 'offer' | 'answer' | 'ice-candidate' }
+>;
 type LeaveMessage = Extract<SignalingInboundMessage, { type: 'leave' }>;
 
 export type SignalingTransportOptions = {
@@ -65,7 +77,7 @@ export class SignalingTransport {
       return;
     }
 
-    this.socket.send(JSON.stringify(message));
+    this.sendJson(message);
   }
 
   public leave(): void {
@@ -79,7 +91,7 @@ export class SignalingTransport {
     };
 
     if (this.socket && this.socket.readyState === WebSocket.OPEN) {
-      this.socket.send(JSON.stringify(leaveMessage));
+      this.sendJson(leaveMessage);
     }
 
     this.clearStoredRoomId();
@@ -164,7 +176,7 @@ export class SignalingTransport {
         peerPublicKey: this.options.peerPublicKey
       };
 
-      this.socket.send(JSON.stringify(joinMessage));
+      this.sendJson(joinMessage);
     } catch (error) {
       this.onError(error instanceof Error ? error : new Error('Failed to fetch signaling token.'));
     }
@@ -193,6 +205,14 @@ export class SignalingTransport {
   private handleMessage(rawData: unknown): void {
     if (typeof rawData !== 'string') {
       this.onError(new Error('Received non-text signaling payload.'));
+      return;
+    }
+
+    const messageSize = utf8ByteLength(rawData);
+    if (messageSize > MAX_SIGNALING_MESSAGE_BYTES) {
+      this.onError(
+        new Error(`Received signaling payload larger than ${MAX_SIGNALING_MESSAGE_BYTES} bytes.`)
+      );
       return;
     }
 
@@ -242,5 +262,25 @@ export class SignalingTransport {
       clearTimeout(this.reconnectTimeoutId);
       this.reconnectTimeoutId = null;
     }
+  }
+
+  private sendJson(value: unknown): void {
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+      this.onError(new Error('Cannot send signaling message while socket is not open.'));
+      return;
+    }
+
+    const serialized = JSON.stringify(value);
+    const messageSize = utf8ByteLength(serialized);
+    if (messageSize > MAX_SIGNALING_MESSAGE_BYTES) {
+      this.onError(
+        new Error(
+          `Refusing to send signaling payload larger than ${MAX_SIGNALING_MESSAGE_BYTES} bytes.`
+        )
+      );
+      return;
+    }
+
+    this.socket.send(serialized);
   }
 }

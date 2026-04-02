@@ -29,11 +29,7 @@ describe('ChatPanel', () => {
     ];
 
     render(
-      <ChatPanel
-        chatMessages={messages}
-        onSendText={onSendText}
-        onSendReaction={onSendReaction}
-      />
+      <ChatPanel chatMessages={messages} onSendText={onSendText} onSendReaction={onSendReaction} />
     );
 
     fireEvent.change(screen.getByPlaceholderText('Type a message'), {
@@ -49,9 +45,33 @@ describe('ChatPanel', () => {
         name: 'React thumbs up to message from Peer 22222222'
       })
     );
-    expect(onSendReaction).toHaveBeenCalledWith(
-      '11111111-1111-4111-8111-111111111111',
-      '👍'
-    );
+    expect(onSendReaction).toHaveBeenCalledWith('11111111-1111-4111-8111-111111111111', '👍');
+  });
+
+  it('trims message before send and disables submit for blank input', () => {
+    const onSendText = vi.fn();
+    render(<ChatPanel chatMessages={[]} onSendText={onSendText} onSendReaction={vi.fn()} />);
+
+    const sendButton = screen.getByRole('button', { name: 'Send' }) as HTMLButtonElement;
+    expect(sendButton.disabled).toBe(true);
+
+    fireEvent.change(screen.getByPlaceholderText('Type a message'), {
+      target: { value: '   padded text   ' }
+    });
+    expect(sendButton.disabled).toBe(false);
+
+    fireEvent.click(sendButton);
+    expect(onSendText).toHaveBeenCalledWith('padded text');
+  });
+
+  it('caps input value at 4000 characters', () => {
+    render(<ChatPanel chatMessages={[]} onSendText={vi.fn()} onSendReaction={vi.fn()} />);
+
+    const input = screen.getByPlaceholderText('Type a message') as HTMLInputElement;
+    fireEvent.change(input, {
+      target: { value: 'x'.repeat(4500) }
+    });
+
+    expect(input.value.length).toBe(4000);
   });
 });

@@ -1,5 +1,7 @@
 import React, { useState } from 'react';
 
+const MAX_CHAT_TEXT_LENGTH = 4000;
+
 type ChatReaction = {
   senderId: string;
   emoji: string;
@@ -27,6 +29,7 @@ export function ChatPanel({
   onSendReaction
 }: ChatPanelProps): React.JSX.Element {
   const [chatInput, setChatInput] = useState<string>('');
+  const canSend = chatInput.trim().length > 0;
 
   return (
     <section>
@@ -36,66 +39,73 @@ export function ChatPanel({
         {chatMessages.map((message) => {
           const senderLabel = message.incoming ? `Peer ${message.senderId.slice(0, 8)}` : 'You';
           return (
-          <p key={message.id}>
-            <strong>{senderLabel}:</strong>{' '}
-            {message.text}
-            {!message.incoming ? ` (${message.readBy.length > 0 ? 'read' : 'sent'})` : ''}
-            {message.reactions.length > 0 ? (
-              <>
-                {' '}
-                {message.reactions.map((reaction, index) => (
-                  <span key={`${message.id}:${reaction.senderId}:${reaction.emoji}:${index}`}>
-                    {reaction.emoji}
-                  </span>
-                ))}
-              </>
-            ) : null}
-            <button
-              type="button"
-              aria-label={`React thumbs up to message from ${senderLabel}`}
-              onClick={() => {
-                onSendReaction(message.id, '👍');
-              }}
-            >
-              👍
-            </button>
-            <button
-              type="button"
-              aria-label={`React heart to message from ${senderLabel}`}
-              onClick={() => {
-                onSendReaction(message.id, '❤️');
-              }}
-            >
-              ❤️
-            </button>
-            <button
-              type="button"
-              aria-label={`React laugh to message from ${senderLabel}`}
-              onClick={() => {
-                onSendReaction(message.id, '😂');
-              }}
-            >
-              😂
-            </button>
-          </p>
+            <p key={message.id}>
+              <strong>{senderLabel}:</strong> {message.text}
+              {!message.incoming ? ` (${message.readBy.length > 0 ? 'read' : 'sent'})` : ''}
+              {message.reactions.length > 0 ? (
+                <>
+                  {' '}
+                  {message.reactions.map((reaction, index) => (
+                    <span key={`${message.id}:${reaction.senderId}:${reaction.emoji}:${index}`}>
+                      {reaction.emoji}
+                    </span>
+                  ))}
+                </>
+              ) : null}
+              <button
+                type="button"
+                aria-label={`React thumbs up to message from ${senderLabel}`}
+                onClick={() => {
+                  onSendReaction(message.id, '👍');
+                }}
+              >
+                👍
+              </button>
+              <button
+                type="button"
+                aria-label={`React heart to message from ${senderLabel}`}
+                onClick={() => {
+                  onSendReaction(message.id, '❤️');
+                }}
+              >
+                ❤️
+              </button>
+              <button
+                type="button"
+                aria-label={`React laugh to message from ${senderLabel}`}
+                onClick={() => {
+                  onSendReaction(message.id, '😂');
+                }}
+              >
+                😂
+              </button>
+            </p>
           );
         })}
       </div>
       <form
         onSubmit={(event) => {
           event.preventDefault();
-          onSendText(chatInput);
+          const trimmed = chatInput.trim();
+          if (!trimmed) {
+            return;
+          }
+
+          onSendText(trimmed);
           setChatInput('');
         }}
       >
         <input
           value={chatInput}
           onChange={(event) => {
-            setChatInput(event.target.value);
+            setChatInput(event.target.value.slice(0, MAX_CHAT_TEXT_LENGTH));
           }}
           placeholder="Type a message"
+          maxLength={MAX_CHAT_TEXT_LENGTH}
         />
-        <button type="submit">Send</button>
+        <button type="submit" disabled={!canSend}>
+          Send
+        </button>
       </form>
     </section>
   );

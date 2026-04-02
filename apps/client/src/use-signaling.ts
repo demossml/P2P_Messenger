@@ -40,6 +40,11 @@ import {
   encodePeerPublicKeyBundle,
   encryptPayloadWithSharedKey
 } from './chat-payload-crypto.js';
+import {
+  readRoomIdFromSessionStorage,
+  ROOM_ID_KEY,
+  writeRoomIdToSessionStorage
+} from './room-storage.js';
 
 type ConnectionStatus = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'closed';
 
@@ -139,6 +144,8 @@ const PREFERRED_AUDIO_OUTPUT_KEY = 'p2p.prefAudioOutputId';
 const FILE_META_ACK_TIMEOUT_MS = 8000;
 const FILE_META_HEARTBEAT_MS = 5000;
 const FILE_META_MAX_RETRIES = 5;
+const MAX_CHAT_TEXT_LENGTH = 4000;
+const MAX_REACTION_LENGTH = 16;
 const RELAY_ENABLE_STREAK_REQUIRED = 2;
 const RELAY_DISABLE_STREAK_REQUIRED = 4;
 const RELAY_TOGGLE_COOLDOWN_MS = 15_000;
@@ -265,7 +272,7 @@ export function useSignaling(): {
 } {
   const [status, setStatus] = useState<ConnectionStatus>('idle');
   const [lastError, setLastError] = useState<string | null>(null);
-  const [roomId, setRoomId] = useState<string>('');
+  const [roomId, setRoomIdState] = useState<string>(() => readRoomIdFromSessionStorage());
   const [remotePeerCount, setRemotePeerCount] = useState<number>(0);
   const [isLocalMediaReady, setIsLocalMediaReady] = useState<boolean>(false);
   const [localStreamState, setLocalStreamState] = useState<MediaStream | null>(null);
@@ -337,6 +344,11 @@ export function useSignaling(): {
       localStorage.setItem(PREFERRED_AUDIO_OUTPUT_KEY, updated.audioOutputId);
       return updated;
     });
+  }
+
+  function setRoomId(value: string): void {
+    setRoomIdState(value);
+    writeRoomIdToSessionStorage(value);
   }
 
   function syncRemoteFingerprintsState(): void {
@@ -411,7 +423,10 @@ export function useSignaling(): {
       payload: payloadForMessage
     };
 
-    const signature = await signBytes(privateKey, new TextEncoder().encode(JSON.stringify(unsigned)));
+    const signature = await signBytes(
+      privateKey,
+      new TextEncoder().encode(JSON.stringify(unsigned))
+    );
     return {
       ...unsigned,
       signature
@@ -436,10 +451,7 @@ export function useSignaling(): {
     syncRemoteFingerprintsState();
   }
 
-  async function verifyIncomingMessage(
-    peerId: string,
-    message: ChatMessage
-  ): Promise<boolean> {
+  async function verifyIncomingMessage(peerId: string, message: ChatMessage): Promise<boolean> {
     if (message.senderId !== peerId) {
       setLastError(`Rejected forged message: senderId ${message.senderId} != peer ${peerId}.`);
       return false;
@@ -458,7 +470,9 @@ export function useSignaling(): {
         remotePeerVerifyKeyRef.current.set(peerId, verifyKey);
       } catch (error) {
         setLastError(
-          error instanceof Error ? error.message : `Failed to import public key for ${peerId.slice(0, 8)}.`
+          error instanceof Error
+            ? error.message
+            : `Failed to import public key for ${peerId.slice(0, 8)}.`
         );
         return false;
       }
@@ -543,7 +557,9 @@ export function useSignaling(): {
 
         const peerStates = buildPeerStates(fileId, entry.totalChunks);
         const receivedChunks =
-          peerStates.length > 0 ? Math.max(...peerStates.map((state) => state.sentChunks)) : entry.receivedChunks;
+          peerStates.length > 0
+            ? Math.max(...peerStates.map((state) => state.sentChunks))
+            : entry.receivedChunks;
 
         return {
           ...entry,
@@ -610,21 +626,24 @@ export function useSignaling(): {
     syncOutgoingTransferUi(fileId);
   }
 
-  async function sendFileMetaToPeer(peerId: string, transfer: OutgoingFileTransfer): Promise<boolean> {
+  async function sendFileMetaToPeer(
+    peerId: string,
+    transfer: OutgoingFileTransfer
+  ): Promise<boolean> {
     const manager = peerManagerRef.current;
     if (!manager || !manager.hasOpenChatChannel(peerId)) {
       return false;
     }
 
-      const message = await createSignedMessageForPeer(peerId, {
-        type: 'file-meta',
-        fileId: transfer.fileId,
-        name: transfer.name,
-        size: transfer.size,
-        totalChunks: transfer.totalChunks,
-        checksum: transfer.checksum
-      });
-      await manager.sendChatMessage(peerId, message);
+    const message = await createSignedMessageForPeer(peerId, {
+      type: 'file-meta',
+      fileId: transfer.fileId,
+      name: transfer.name,
+      size: transfer.size,
+      totalChunks: transfer.totalChunks,
+      checksum: transfer.checksum
+    });
+    await manager.sendChatMessage(peerId, message);
 
     const peerState = getOrCreatePeerAckState(transfer.fileId, peerId);
     peerState.lastMetaSentAt = Date.now();
@@ -722,7 +741,8 @@ export function useSignaling(): {
           PEER_PUBLIC_KEY_KEY,
           PEER_PRIVATE_KEY_KEY
         ).catch(() => null);
-        const storedIdentity = migrated ?? (await readSigningIdentityFromIndexedDb().catch(() => null));
+        const storedIdentity =
+          migrated ?? (await readSigningIdentityFromIndexedDb().catch(() => null));
 
         if (storedIdentity) {
           const signingKeyPair = await deserializeSigningKeyPair({
@@ -794,6 +814,7 @@ export function useSignaling(): {
       url: defaultSignalingUrl(),
       peerId: identity.peerId,
       peerPublicKey: peerPublicKey || 'pending',
+      roomStorageKey: ROOM_ID_KEY,
       getToken: async () => {
         const apiBaseUrl = defaultApiBaseUrl();
         const accessToken = sessionStorage.getItem(ACCESS_TOKEN_KEY);
@@ -914,9 +935,7 @@ export function useSignaling(): {
           relayEnableStreakRef.current = 0;
           setNetworkNotice('Relay mode enabled for better stability on weak network conditions.');
         } catch (error) {
-          setLastError(
-            error instanceof Error ? error.message : 'Failed to enable relay mode.'
-          );
+          setLastError(error instanceof Error ? error.message : 'Failed to enable relay mode.');
         } finally {
           relayToggleInFlightRef.current = false;
         }
@@ -939,9 +958,7 @@ export function useSignaling(): {
           relayDisableStreakRef.current = 0;
           setNetworkNotice('Relay mode disabled, direct path restored.');
         } catch (error) {
-          setLastError(
-            error instanceof Error ? error.message : 'Failed to disable relay mode.'
-          );
+          setLastError(error instanceof Error ? error.message : 'Failed to disable relay mode.');
         } finally {
           relayToggleInFlightRef.current = false;
         }
@@ -1006,223 +1023,226 @@ export function useSignaling(): {
             return;
           }
 
-        if (payload.type === 'text') {
-          setChatMessages((current) => [
-            ...current,
-            {
-              id: message.id,
-              senderId: message.senderId,
-              text: payload.text,
-              timestamp: message.timestamp,
-              incoming: message.senderId !== identity.peerId,
-              readBy: [],
-              reactions: []
+          if (payload.type === 'text') {
+            setChatMessages((current) => [
+              ...current,
+              {
+                id: message.id,
+                senderId: message.senderId,
+                text: payload.text,
+                timestamp: message.timestamp,
+                incoming: message.senderId !== identity.peerId,
+                readBy: [],
+                reactions: []
+              }
+            ]);
+
+            if (message.senderId !== identity.peerId) {
+              void (async () => {
+                const receipt = await createSignedMessageForPeer(peerId, {
+                  type: 'receipt',
+                  messageId: message.id
+                });
+                await peerManagerRef.current?.sendChatMessage(peerId, receipt);
+              })();
             }
-          ]);
-
-          if (message.senderId !== identity.peerId) {
-            void (async () => {
-              const receipt = await createSignedMessageForPeer(peerId, {
-                type: 'receipt',
-                messageId: message.id
-              });
-              await peerManagerRef.current?.sendChatMessage(peerId, receipt);
-            })();
+            return;
           }
-          return;
-        }
 
-        if (payload.type === 'receipt') {
-          setChatMessages((current) =>
-            current.map((entry) => {
-              if (entry.id !== payload.messageId) {
-                return entry;
-              }
-
-              if (entry.readBy.includes(message.senderId)) {
-                return entry;
-              }
-
-              return {
-                ...entry,
-                readBy: [...entry.readBy, message.senderId]
-              };
-            })
-          );
-          return;
-        }
-
-        if (payload.type === 'reaction') {
-          setChatMessages((current) =>
-            current.map((entry) => {
-              if (entry.id !== payload.messageId) {
-                return entry;
-              }
-
-              const hasReaction = entry.reactions.some(
-                (reaction) =>
-                  reaction.senderId === message.senderId && reaction.emoji === payload.emoji
-              );
-
-              if (hasReaction) {
-                return entry;
-              }
-
-              return {
-                ...entry,
-                reactions: [
-                  ...entry.reactions,
-                  {
-                    senderId: message.senderId,
-                    emoji: payload.emoji
-                  }
-                ]
-              };
-            })
-          );
-          return;
-        }
-
-        if (payload.type === 'file-meta') {
-          const existingChunks = incomingFileChunksRef.current.get(payload.fileId) ?? new Map<number, string>();
-          incomingFileChunksRef.current.set(payload.fileId, existingChunks);
-
-          const existingTransfer = incomingFileMetaRef.current.get(payload.fileId);
-          const transfer: FileTransferEntry = {
-            fileId: payload.fileId,
-            name: payload.name,
-            size: payload.size,
-            totalChunks: payload.totalChunks,
-            receivedChunks: existingChunks.size,
-            status: existingTransfer?.status === 'completed' ? 'completed' : 'receiving',
-            checksum: payload.checksum,
-            peerStates: [],
-            ...(existingTransfer?.downloadUrl
-              ? {
-                  downloadUrl: existingTransfer.downloadUrl
+          if (payload.type === 'receipt') {
+            setChatMessages((current) =>
+              current.map((entry) => {
+                if (entry.id !== payload.messageId) {
+                  return entry;
                 }
-              : {})
-          };
 
-          incomingFileMetaRef.current.set(payload.fileId, transfer);
+                if (entry.readBy.includes(message.senderId)) {
+                  return entry;
+                }
 
-          setFileTransfers((current) => {
-            const withoutExisting = current.filter((entry) => entry.fileId !== payload.fileId);
-            return [...withoutExisting, transfer];
-          });
+                return {
+                  ...entry,
+                  readBy: [...entry.readBy, message.senderId]
+                };
+              })
+            );
+            return;
+          }
 
-          if (transfer.status === 'completed') {
+          if (payload.type === 'reaction') {
+            setChatMessages((current) =>
+              current.map((entry) => {
+                if (entry.id !== payload.messageId) {
+                  return entry;
+                }
+
+                const hasReaction = entry.reactions.some(
+                  (reaction) =>
+                    reaction.senderId === message.senderId && reaction.emoji === payload.emoji
+                );
+
+                if (hasReaction) {
+                  return entry;
+                }
+
+                return {
+                  ...entry,
+                  reactions: [
+                    ...entry.reactions,
+                    {
+                      senderId: message.senderId,
+                      emoji: payload.emoji
+                    }
+                  ]
+                };
+              })
+            );
+            return;
+          }
+
+          if (payload.type === 'file-meta') {
+            const existingChunks =
+              incomingFileChunksRef.current.get(payload.fileId) ?? new Map<number, string>();
+            incomingFileChunksRef.current.set(payload.fileId, existingChunks);
+
+            const existingTransfer = incomingFileMetaRef.current.get(payload.fileId);
+            const transfer: FileTransferEntry = {
+              fileId: payload.fileId,
+              name: payload.name,
+              size: payload.size,
+              totalChunks: payload.totalChunks,
+              receivedChunks: existingChunks.size,
+              status: existingTransfer?.status === 'completed' ? 'completed' : 'receiving',
+              checksum: payload.checksum,
+              peerStates: [],
+              ...(existingTransfer?.downloadUrl
+                ? {
+                    downloadUrl: existingTransfer.downloadUrl
+                  }
+                : {})
+            };
+
+            incomingFileMetaRef.current.set(payload.fileId, transfer);
+
+            setFileTransfers((current) => {
+              const withoutExisting = current.filter((entry) => entry.fileId !== payload.fileId);
+              return [...withoutExisting, transfer];
+            });
+
+            if (transfer.status === 'completed') {
+              void (async () => {
+                const ack = await createSignedMessageForPeer(peerId, {
+                  type: 'file-ack',
+                  fileId: payload.fileId,
+                  status: 'complete'
+                });
+                await peerManagerRef.current?.sendChatMessage(peerId, ack);
+              })();
+              return;
+            }
+
+            const missingChunks = buildMissingChunkIndexes(payload.totalChunks, existingChunks);
+
             void (async () => {
               const ack = await createSignedMessageForPeer(peerId, {
                 type: 'file-ack',
                 fileId: payload.fileId,
-                status: 'complete'
+                status: 'accepted',
+                missingChunks
               });
               await peerManagerRef.current?.sendChatMessage(peerId, ack);
             })();
             return;
           }
 
-          const missingChunks = buildMissingChunkIndexes(payload.totalChunks, existingChunks);
-
-          void (async () => {
-            const ack = await createSignedMessageForPeer(peerId, {
-              type: 'file-ack',
-              fileId: payload.fileId,
-              status: 'accepted',
-              missingChunks
-            });
-            await peerManagerRef.current?.sendChatMessage(peerId, ack);
-          })();
-          return;
-        }
-
-        if (payload.type === 'file-chunk') {
-          const chunks = incomingFileChunksRef.current.get(payload.fileId);
-          const meta = incomingFileMetaRef.current.get(payload.fileId);
-          if (!chunks || !meta) {
-            return;
-          }
-
-          if (chunks.has(payload.chunkIndex)) {
-            return;
-          }
-
-          chunks.set(payload.chunkIndex, payload.data);
-          const receivedChunks = chunks.size;
-
-          setFileTransfers((current) =>
-            current.map((entry) =>
-              entry.fileId === payload.fileId
-                ? {
-                    ...entry,
-                    receivedChunks
-                  }
-                : entry
-            )
-          );
-
-          if (receivedChunks < meta.totalChunks) {
-            return;
-          }
-
-          void (async () => {
-            try {
-              const merged = assembleChunkMapToBytes(meta.totalChunks, chunks);
-              const mergedBuffer = merged.buffer.slice(
-                merged.byteOffset,
-                merged.byteOffset + merged.byteLength
-              ) as ArrayBuffer;
-
-              const checksum = `sha256:${await sha256Hex(mergedBuffer)}`;
-              if (checksum !== meta.checksum) {
-                throw new Error('Checksum mismatch.');
-              }
-
-              const downloadUrl = URL.createObjectURL(new Blob([mergedBuffer]));
-              const completedTransfer: FileTransferEntry = {
-                ...meta,
-                receivedChunks: meta.totalChunks,
-                status: 'completed',
-                downloadUrl
-              };
-
-              incomingFileMetaRef.current.set(payload.fileId, completedTransfer);
-              setFileTransfers((current) =>
-                current.map((entry) => (entry.fileId === payload.fileId ? completedTransfer : entry))
-              );
-
-              const ack = await createSignedMessageForPeer(peerId, {
-                type: 'file-ack',
-                fileId: payload.fileId,
-                status: 'complete'
-              });
-              await peerManagerRef.current?.sendChatMessage(peerId, ack);
-            } catch (error) {
-              const reason = error instanceof Error ? error.message : 'Failed to assemble file.';
-              setFileTransfers((current) =>
-                current.map((entry) =>
-                  entry.fileId === payload.fileId
-                    ? {
-                        ...entry,
-                        status: 'failed',
-                        error: reason
-                      }
-                    : entry
-                )
-              );
-
-              const ack = await createSignedMessageForPeer(peerId, {
-                type: 'file-ack',
-                fileId: payload.fileId,
-                status: 'rejected',
-                reason
-              });
-              await peerManagerRef.current?.sendChatMessage(peerId, ack);
+          if (payload.type === 'file-chunk') {
+            const chunks = incomingFileChunksRef.current.get(payload.fileId);
+            const meta = incomingFileMetaRef.current.get(payload.fileId);
+            if (!chunks || !meta) {
+              return;
             }
-          })();
-          return;
-        }
+
+            if (chunks.has(payload.chunkIndex)) {
+              return;
+            }
+
+            chunks.set(payload.chunkIndex, payload.data);
+            const receivedChunks = chunks.size;
+
+            setFileTransfers((current) =>
+              current.map((entry) =>
+                entry.fileId === payload.fileId
+                  ? {
+                      ...entry,
+                      receivedChunks
+                    }
+                  : entry
+              )
+            );
+
+            if (receivedChunks < meta.totalChunks) {
+              return;
+            }
+
+            void (async () => {
+              try {
+                const merged = assembleChunkMapToBytes(meta.totalChunks, chunks);
+                const mergedBuffer = merged.buffer.slice(
+                  merged.byteOffset,
+                  merged.byteOffset + merged.byteLength
+                ) as ArrayBuffer;
+
+                const checksum = `sha256:${await sha256Hex(mergedBuffer)}`;
+                if (checksum !== meta.checksum) {
+                  throw new Error('Checksum mismatch.');
+                }
+
+                const downloadUrl = URL.createObjectURL(new Blob([mergedBuffer]));
+                const completedTransfer: FileTransferEntry = {
+                  ...meta,
+                  receivedChunks: meta.totalChunks,
+                  status: 'completed',
+                  downloadUrl
+                };
+
+                incomingFileMetaRef.current.set(payload.fileId, completedTransfer);
+                setFileTransfers((current) =>
+                  current.map((entry) =>
+                    entry.fileId === payload.fileId ? completedTransfer : entry
+                  )
+                );
+
+                const ack = await createSignedMessageForPeer(peerId, {
+                  type: 'file-ack',
+                  fileId: payload.fileId,
+                  status: 'complete'
+                });
+                await peerManagerRef.current?.sendChatMessage(peerId, ack);
+              } catch (error) {
+                const reason = error instanceof Error ? error.message : 'Failed to assemble file.';
+                setFileTransfers((current) =>
+                  current.map((entry) =>
+                    entry.fileId === payload.fileId
+                      ? {
+                          ...entry,
+                          status: 'failed',
+                          error: reason
+                        }
+                      : entry
+                  )
+                );
+
+                const ack = await createSignedMessageForPeer(peerId, {
+                  type: 'file-ack',
+                  fileId: payload.fileId,
+                  status: 'rejected',
+                  reason
+                });
+                await peerManagerRef.current?.sendChatMessage(peerId, ack);
+              }
+            })();
+            return;
+          }
 
           if (payload.type === 'file-ack') {
             const peerAckState = getOrCreatePeerAckState(payload.fileId, peerId);
@@ -1274,6 +1294,10 @@ export function useSignaling(): {
 
   useEffect(() => {
     transportRef.current = transport;
+    const restored = readRoomIdFromSessionStorage();
+    if (restored) {
+      setRoomIdState(restored);
+    }
     transport.reconnectFromSession();
 
     return () => {
@@ -1395,7 +1419,8 @@ export function useSignaling(): {
               jitterMs: peerJitterMs
             });
 
-            const targetKbps = assessment.quality === 'poor' ? 350 : assessment.quality === 'fair' ? 800 : 1500;
+            const targetKbps =
+              assessment.quality === 'poor' ? 350 : assessment.quality === 'fair' ? 800 : 1500;
             if (bitrateByPeerRef.current.get(peerId) !== targetKbps) {
               for (const sender of connection.getSenders()) {
                 if (sender.track?.kind !== 'video') {
@@ -1435,9 +1460,13 @@ export function useSignaling(): {
 
         if (aggregateAssessment.quality !== lastQualityRef.current) {
           if (aggregateAssessment.quality === 'poor') {
-            setNetworkNotice('Connection quality is poor. Lowering video bitrate and preparing relay fallback.');
+            setNetworkNotice(
+              'Connection quality is poor. Lowering video bitrate and preparing relay fallback.'
+            );
           } else if (aggregateAssessment.quality === 'fair') {
-            setNetworkNotice('Connection quality is fair. Video bitrate reduced to keep call stable.');
+            setNetworkNotice(
+              'Connection quality is fair. Video bitrate reduced to keep call stable.'
+            );
           } else {
             setNetworkNotice('Connection quality recovered to good.');
           }
@@ -1534,6 +1563,8 @@ export function useSignaling(): {
           }
 
           setLastError(null);
+          setRoomIdState(normalizedRoomId);
+          writeRoomIdToSessionStorage(normalizedRoomId);
           transportRef.current?.connect(normalizedRoomId);
         } catch (error) {
           setLastError(error instanceof Error ? error.message : 'Failed to start local media.');
@@ -1572,6 +1603,8 @@ export function useSignaling(): {
       setRemoteStreamsState([]);
       setRemotePeerCount(0);
       setFileTransfers([]);
+      setRoomIdState('');
+      writeRoomIdToSessionStorage('');
       transportRef.current?.disconnect();
     },
     toggleMute: () => {
@@ -1641,7 +1674,9 @@ export function useSignaling(): {
               }
 
               const restoredStream = new MediaStream(
-                [currentAudio, cameraTrack].filter((track): track is MediaStreamTrack => Boolean(track))
+                [currentAudio, cameraTrack].filter((track): track is MediaStreamTrack =>
+                  Boolean(track)
+                )
               );
 
               await manager.replaceTrack('video', cameraTrack);
@@ -1693,6 +1728,10 @@ export function useSignaling(): {
       if (!trimmedText) {
         return;
       }
+      if (trimmedText.length > MAX_CHAT_TEXT_LENGTH) {
+        setLastError(`Message is too long. Maximum length is ${MAX_CHAT_TEXT_LENGTH} characters.`);
+        return;
+      }
 
       void (async () => {
         const manager = peerManagerRef.current;
@@ -1728,6 +1767,10 @@ export function useSignaling(): {
     sendReaction: (messageId: string, emoji: string) => {
       const normalizedEmoji = emoji.trim();
       if (!normalizedEmoji) {
+        return;
+      }
+      if (normalizedEmoji.length > MAX_REACTION_LENGTH) {
+        setLastError(`Reaction is too long. Maximum length is ${MAX_REACTION_LENGTH} characters.`);
         return;
       }
 

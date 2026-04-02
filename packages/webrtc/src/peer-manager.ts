@@ -1,8 +1,4 @@
-import {
-  chatMessageSchema,
-  type ChatMessage,
-  type SignalingOutboundMessage
-} from '@p2p/shared';
+import { chatMessageSchema, type ChatMessage, type SignalingOutboundMessage } from '@p2p/shared';
 import type { SignalingTransport } from './signaling-transport.js';
 import { defaultIceServers } from './default-ice-servers.js';
 
@@ -24,7 +20,19 @@ type PeerContext = {
   chatChannel?: RTCDataChannel;
 };
 
-type SignaledIceCandidate = Extract<SignalingOutboundMessage, { type: 'ice-candidate' }>['candidate'];
+type SignaledIceCandidate = Extract<
+  SignalingOutboundMessage,
+  { type: 'ice-candidate' }
+>['candidate'];
+const MAX_CHAT_MESSAGE_BYTES = 256 * 1024;
+
+function utf8ByteLength(value: string): number {
+  if (typeof TextEncoder !== 'undefined') {
+    return new TextEncoder().encode(value).byteLength;
+  }
+
+  return value.length;
+}
 
 export class PeerManager {
   private readonly peers = new Map<string, PeerContext>();
@@ -184,7 +192,10 @@ export class PeerManager {
     return this.options.localPeerId.localeCompare(remotePeerId) > 0;
   }
 
-  private async ensurePeerConnection(remotePeerId: string, createOffer: boolean): Promise<PeerContext> {
+  private async ensurePeerConnection(
+    remotePeerId: string,
+    createOffer: boolean
+  ): Promise<PeerContext> {
     const existing = this.peers.get(remotePeerId);
     if (existing) {
       if (createOffer) {
@@ -194,9 +205,7 @@ export class PeerManager {
       return existing;
     }
 
-    const connection = new RTCPeerConnection(
-      this.buildRtcConfiguration()
-    );
+    const connection = new RTCPeerConnection(this.buildRtcConfiguration());
 
     const remoteStream = new MediaStream();
     const context: PeerContext = {
@@ -284,7 +293,10 @@ export class PeerManager {
     }
   }
 
-  private async createAndSendOffer(remotePeerId: string, connection: RTCPeerConnection): Promise<void> {
+  private async createAndSendOffer(
+    remotePeerId: string,
+    connection: RTCPeerConnection
+  ): Promise<void> {
     await this.restartIce(remotePeerId, connection);
   }
 
@@ -321,9 +333,7 @@ export class PeerManager {
 
     return {
       ...base,
-      iceTransportPolicy: this.relayModeEnabled
-        ? 'relay'
-        : (base.iceTransportPolicy ?? 'all')
+      iceTransportPolicy: this.relayModeEnabled ? 'relay' : (base.iceTransportPolicy ?? 'all')
     };
   }
 
@@ -463,6 +473,12 @@ export class PeerManager {
     channel.onmessage = (event) => {
       if (typeof event.data !== 'string') {
         this.onError(new Error('Incoming chat message must be text JSON.'));
+        return;
+      }
+
+      const messageSize = utf8ByteLength(event.data);
+      if (messageSize > MAX_CHAT_MESSAGE_BYTES) {
+        this.onError(new Error(`Incoming chat message exceeds ${MAX_CHAT_MESSAGE_BYTES} bytes.`));
         return;
       }
 

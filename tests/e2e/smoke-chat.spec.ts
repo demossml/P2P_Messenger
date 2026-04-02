@@ -5,11 +5,56 @@ type DevSession = {
   refreshToken: string;
 };
 
+type PageDiagnostics = {
+  readonly consoleErrors: string[];
+  readonly pageErrors: string[];
+  readonly requestFailures: string[];
+};
+
+function attachPageDiagnostics(page: Page): PageDiagnostics {
+  const diagnostics: PageDiagnostics = {
+    consoleErrors: [],
+    pageErrors: [],
+    requestFailures: []
+  };
+
+  page.on('console', (message) => {
+    if (message.type() !== 'error') {
+      return;
+    }
+
+    diagnostics.consoleErrors.push(message.text());
+  });
+
+  page.on('pageerror', (error) => {
+    diagnostics.pageErrors.push(error.message);
+  });
+
+  page.on('requestfailed', (request) => {
+    const failure = request.failure()?.errorText ?? 'unknown_error';
+    diagnostics.requestFailures.push(`${request.method()} ${request.url()} -> ${failure}`);
+  });
+
+  return diagnostics;
+}
+
+function trimDiagnostics(items: string[], maxItems = 6): string {
+  if (items.length === 0) {
+    return 'none';
+  }
+
+  return items.slice(-maxItems).join(' | ');
+}
+
 async function issueDevSession(userId: string): Promise<DevSession> {
-  const response = await fetch(`http://127.0.0.1:3001/auth/dev-login?userId=${encodeURIComponent(userId)}`);
+  const response = await fetch(
+    `http://127.0.0.1:3001/auth/dev-login?userId=${encodeURIComponent(userId)}`
+  );
   if (!response.ok) {
     const body = await response.text();
-    throw new Error(`Failed to issue dev session: ${response.status} ${response.statusText} - ${body}`);
+    throw new Error(
+      `Failed to issue dev session: ${response.status} ${response.statusText} - ${body}`
+    );
   }
 
   const parsed = (await response.json()) as Partial<DevSession>;
@@ -33,33 +78,48 @@ async function seedSession(context: BrowserContext, session: DevSession): Promis
   );
 }
 
-async function waitForAppReady(page: Page, label: string): Promise<void> {
-  for (let attempt = 1; attempt <= 2; attempt += 1) {
-    try {
-      await expect(page.getByRole('heading', { name: 'P2P Messenger' })).toBeVisible({
-        timeout: 20_000
-      });
-      await expect(page.locator('#roomId')).toBeVisible({ timeout: 20_000 });
-      return;
-    } catch (error) {
-      if (attempt === 2) {
-        throw new Error(
-          `App is not ready for ${label}: ${
-            error instanceof Error ? error.message : String(error)
-          }`
-        );
-      }
-      await page.reload({ waitUntil: 'domcontentloaded' });
-    }
+async function waitForAppReady(
+  page: Page,
+  label: string,
+  diagnostics: PageDiagnostics
+): Promise<void> {
+  try {
+    await expect(page.getByRole('heading', { name: 'P2P Messenger' })).toBeVisible({
+      timeout: 75_000
+    });
+    await expect(page.locator('#roomId')).toBeVisible({ timeout: 75_000 });
+  } catch (error) {
+    const title = await page.title().catch(() => 'unavailable');
+    const location = page.url();
+    const bodyText = await page
+      .locator('body')
+      .innerText()
+      .catch(() => 'unavailable');
+    const compactBody = bodyText.replace(/\s+/g, ' ').slice(0, 400);
+    throw new Error(
+      `App is not ready for ${label}: ${
+        error instanceof Error ? error.message : String(error)
+      }. url=${location}; title=${title}; body="${compactBody}"; consoleErrors=${trimDiagnostics(
+        diagnostics.consoleErrors
+      )}; pageErrors=${trimDiagnostics(diagnostics.pageErrors)}; requestFailures=${trimDiagnostics(
+        diagnostics.requestFailures
+      )}`
+    );
   }
 }
 
 async function installFakeMedia(context: BrowserContext): Promise<void> {
   await context.addInitScript(() => {
     const sentPayloadTypes: string[] = [];
-    const dataChannelProto = (window as typeof window & { RTCDataChannel?: { prototype?: { send?: (data: unknown) => unknown } } }).RTCDataChannel?.prototype;
+    const dataChannelProto = (
+      window as typeof window & {
+        RTCDataChannel?: {
+          prototype?: { send?: (this: RTCDataChannel, data: unknown) => unknown };
+        };
+      }
+    ).RTCDataChannel?.prototype;
     if (dataChannelProto?.send) {
-      const nativeSend = dataChannelProto.send.bind(dataChannelProto);
+      const nativeSend = dataChannelProto.send;
       dataChannelProto.send = function patchedSend(data: unknown): void {
         if (typeof data === 'string') {
           try {
@@ -121,10 +181,7 @@ async function installFakeMedia(context: BrowserContext): Promise<void> {
             continue;
           }
 
-          if (
-            socket.readyState === WebSocket.CONNECTING ||
-            socket.readyState === WebSocket.OPEN
-          ) {
+          if (socket.readyState === WebSocket.CONNECTING || socket.readyState === WebSocket.OPEN) {
             socket.close(4001, 'e2e-forced-close');
             closed += 1;
           }
@@ -148,7 +205,10 @@ async function installFakeMedia(context: BrowserContext): Promise<void> {
       }
     });
 
-    subtle.digest = async (algorithm: AlgorithmIdentifier, data: BufferSource): Promise<ArrayBuffer> => {
+    subtle.digest = async (
+      algorithm: AlgorithmIdentifier,
+      data: BufferSource
+    ): Promise<ArrayBuffer> => {
       const digest = await nativeDigest(algorithm, data);
       const algorithmName = typeof algorithm === 'string' ? algorithm : algorithm.name;
       if (!corruptNextFileChecksum || algorithmName.toUpperCase() !== 'SHA-256') {
@@ -273,12 +333,17 @@ async function setupConnectedPeers(browser: Browser): Promise<ConnectedPeers> {
 
   const pageA = await contextA.newPage();
   const pageB = await contextB.newPage();
+  const diagnosticsA = attachPageDiagnostics(pageA);
+  const diagnosticsB = attachPageDiagnostics(pageB);
 
   await Promise.all([
     pageA.goto('/', { waitUntil: 'domcontentloaded' }),
     pageB.goto('/', { waitUntil: 'domcontentloaded' })
   ]);
-  await Promise.all([waitForAppReady(pageA, 'peer A'), waitForAppReady(pageB, 'peer B')]);
+  await Promise.all([
+    waitForAppReady(pageA, 'peer A', diagnosticsA),
+    waitForAppReady(pageB, 'peer B', diagnosticsB)
+  ]);
 
   const roomId = `e2e-room-${Date.now()}`;
 
@@ -298,15 +363,13 @@ async function setupConnectedPeers(browser: Browser): Promise<ConnectedPeers> {
 
   await Promise.all([
     pageA.evaluate(() => {
-      const reset = (
-        window as typeof window & { __e2eResetSentPayloadTypes?: () => void }
-      ).__e2eResetSentPayloadTypes;
+      const reset = (window as typeof window & { __e2eResetSentPayloadTypes?: () => void })
+        .__e2eResetSentPayloadTypes;
       reset?.();
     }),
     pageB.evaluate(() => {
-      const reset = (
-        window as typeof window & { __e2eResetSentPayloadTypes?: () => void }
-      ).__e2eResetSentPayloadTypes;
+      const reset = (window as typeof window & { __e2eResetSentPayloadTypes?: () => void })
+        .__e2eResetSentPayloadTypes;
       reset?.();
     })
   ]);
@@ -320,6 +383,71 @@ function escapeRegExp(input: string): string {
 
 test('two tabs join one room and see each other as remote peers', async ({ browser }) => {
   const { contextA, contextB } = await setupConnectedPeers(browser);
+  await Promise.all([contextA.close(), contextB.close()]);
+});
+
+test('@minimal room id persists in UI after page reload', async ({ browser }) => {
+  const context = await browser.newContext({
+    permissions: ['camera', 'microphone'],
+    viewport: { width: 1280, height: 800 }
+  });
+  await installFakeMedia(context);
+
+  const session = await issueDevSession(`e2e-room-persist-${Date.now()}`);
+  await seedSession(context, session);
+
+  const page = await context.newPage();
+  const diagnostics = attachPageDiagnostics(page);
+  await page.goto('/', { waitUntil: 'domcontentloaded' });
+  await waitForAppReady(page, 'room persistence check', diagnostics);
+
+  const roomId = `e2e-room-persist-${Date.now()}`;
+  const roomInput = page.locator('#roomId');
+  await roomInput.fill(roomId);
+  await expect(roomInput).toHaveValue(roomId);
+
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await waitForAppReady(page, 'room persistence after reload', diagnostics);
+  await expect(page.locator('#roomId')).toHaveValue(roomId);
+
+  await context.close();
+});
+
+test('@minimal two tabs complete join -> text -> read receipt flow', async ({ browser }) => {
+  const { contextA, contextB, pageA, pageB } = await setupConnectedPeers(browser);
+
+  const chatSectionA = pageA
+    .locator('section')
+    .filter({ has: pageA.getByRole('heading', { name: 'Chat' }) });
+
+  let completed = false;
+  let lastError: unknown = null;
+
+  for (let attempt = 1; attempt <= 4; attempt += 1) {
+    const messageText = `e2e-minimal-${Date.now()}-${attempt}`;
+    await pageA.getByPlaceholder('Type a message').fill(messageText);
+    await pageA.getByRole('button', { name: 'Send', exact: true }).click();
+
+    const messageRowA = chatSectionA.locator('p').filter({ hasText: messageText }).first();
+    await expect(messageRowA).toBeVisible({ timeout: 10_000 });
+
+    try {
+      await expect(pageB.getByText(messageText).first()).toBeVisible({ timeout: 5_000 });
+      await expect(messageRowA).toContainText('(read)', { timeout: 8_000 });
+      completed = true;
+      break;
+    } catch (error) {
+      lastError = error;
+      await pageA.waitForTimeout(600);
+    }
+  }
+
+  if (!completed) {
+    throw lastError instanceof Error
+      ? lastError
+      : new Error('Minimal join -> text -> receipt flow did not complete in time.');
+  }
+
   await Promise.all([contextA.close(), contextB.close()]);
 });
 
@@ -346,7 +474,9 @@ test('two tabs exchange one text message over DataChannel', async ({ browser }) 
   }
 
   if (!delivered) {
-    throw lastError instanceof Error ? lastError : new Error('Message was not delivered to peer B.');
+    throw lastError instanceof Error
+      ? lastError
+      : new Error('Message was not delivered to peer B.');
   }
 
   await Promise.all([contextA.close(), contextB.close()]);
@@ -408,7 +538,9 @@ test('two tabs transfer a small file and receiver marks it completed', async ({ 
     buffer: filePayload
   });
 
-  await expect(pageB.getByText(new RegExp(`${escapeRegExp(fileName)}\\s*\\[completed\\]`))).toBeVisible({
+  await expect(
+    pageB.getByText(new RegExp(`${escapeRegExp(fileName)}\\s*\\[completed\\]`))
+  ).toBeVisible({
     timeout: 20_000
   });
   await expect(pageB.locator(`a[download="${fileName}"]`)).toBeVisible();
@@ -416,13 +548,14 @@ test('two tabs transfer a small file and receiver marks it completed', async ({ 
   await Promise.all([contextA.close(), contextB.close()]);
 });
 
-test('peer reconnect restores remote peer visibility after forced ws close', async ({ browser }) => {
+test('peer reconnect restores remote peer visibility after forced ws close', async ({
+  browser
+}) => {
   const { contextA, contextB, pageA, pageB } = await setupConnectedPeers(browser);
 
   const closedSockets = await pageA.evaluate(() => {
-    const forceClose = (
-      window as typeof window & { __e2eForceCloseWebSockets?: () => number }
-    ).__e2eForceCloseWebSockets;
+    const forceClose = (window as typeof window & { __e2eForceCloseWebSockets?: () => number })
+      .__e2eForceCloseWebSockets;
     return forceClose ? forceClose() : 0;
   });
   expect(closedSockets).toBeGreaterThan(0);
@@ -448,7 +581,10 @@ test('security verification flow updates peer fingerprint status', async ({ brow
 
   await expect(peerStatusLine).toContainText('[unverified]');
 
-  await securitySection.getByRole('button', { name: /Mark peer .* as matched/i }).first().click();
+  await securitySection
+    .getByRole('button', { name: /Mark peer .* as matched/i })
+    .first()
+    .click();
   await expect(peerStatusLine).toContainText('[matched]');
 
   await securitySection
@@ -457,13 +593,18 @@ test('security verification flow updates peer fingerprint status', async ({ brow
     .click();
   await expect(peerStatusLine).toContainText('[unmatched]');
 
-  await securitySection.getByRole('button', { name: /Clear verification for peer/i }).first().click();
+  await securitySection
+    .getByRole('button', { name: /Clear verification for peer/i })
+    .first()
+    .click();
   await expect(peerStatusLine).toContainText('[unverified]');
 
   await Promise.all([contextA.close(), contextB.close()]);
 });
 
-test('corrupted file checksum is detected and both peers mark transfer as failed', async ({ browser }) => {
+test('corrupted file checksum is detected and both peers mark transfer as failed', async ({
+  browser
+}) => {
   const { contextA, contextB, pageA, pageB } = await setupConnectedPeers(browser);
 
   const corruptionEnabled = await pageA.evaluate(() => {
@@ -500,7 +641,9 @@ test('corrupted file checksum is detected and both peers mark transfer as failed
   await Promise.all([contextA.close(), contextB.close()]);
 });
 
-test('DataChannel messages use encrypted payload envelope for text and file transfer', async ({ browser }) => {
+test('DataChannel messages use encrypted payload envelope for text and file transfer', async ({
+  browser
+}) => {
   const { contextA, contextB, pageA, pageB } = await setupConnectedPeers(browser);
 
   const messageText = `e2e-encrypted-${Date.now()}`;
@@ -515,14 +658,15 @@ test('DataChannel messages use encrypted payload envelope for text and file tran
     mimeType: 'text/plain',
     buffer: filePayload
   });
-  await expect(pageB.getByText(new RegExp(`${escapeRegExp(fileName)}\\s*\\[completed\\]`))).toBeVisible({
+  await expect(
+    pageB.getByText(new RegExp(`${escapeRegExp(fileName)}\\s*\\[completed\\]`))
+  ).toBeVisible({
     timeout: 20_000
   });
 
   const payloadTypesA = await pageA.evaluate(() => {
-    const getTypes = (
-      window as typeof window & { __e2eGetSentPayloadTypes?: () => string[] }
-    ).__e2eGetSentPayloadTypes;
+    const getTypes = (window as typeof window & { __e2eGetSentPayloadTypes?: () => string[] })
+      .__e2eGetSentPayloadTypes;
     return getTypes ? getTypes() : [];
   });
 

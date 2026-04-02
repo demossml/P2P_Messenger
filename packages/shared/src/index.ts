@@ -1,8 +1,12 @@
 import { z } from 'zod';
 
+export const MAX_SIGNALING_MESSAGE_BYTES = 8 * 1024;
+export const MAX_CHAT_MESSAGE_BYTES = 256 * 1024;
+
 export const roomIdSchema = z.string().min(3).max(128);
 export const peerIdSchema = z.string().uuid();
 export const roomTokenSchema = z.string().min(16);
+export const peerPublicKeySchema = z.string().min(1).max(4096);
 
 export type RoomId = z.infer<typeof roomIdSchema>;
 export type PeerId = z.infer<typeof peerIdSchema>;
@@ -12,7 +16,7 @@ export const joinMessageSchema = z.object({
   roomId: roomIdSchema,
   peerId: peerIdSchema,
   token: roomTokenSchema,
-  peerPublicKey: z.string().min(1)
+  peerPublicKey: peerPublicKeySchema
 });
 
 export const offerMessageSchema = z.object({
@@ -91,7 +95,7 @@ export const relayedIceCandidateMessageSchema = z.object({
 export const peerJoinedMessageSchema = z.object({
   type: z.literal('peer-joined'),
   peerId: peerIdSchema,
-  peerPublicKey: z.string()
+  peerPublicKey: peerPublicKeySchema
 });
 
 export const peerLeftMessageSchema = z.object({

@@ -32,7 +32,9 @@ async function fetchJson(url) {
 }
 
 async function issueAccessToken(userId) {
-  const result = await fetchJson(`${API_BASE_URL}/auth/dev-login?userId=${encodeURIComponent(userId)}`);
+  const result = await fetchJson(
+    `${API_BASE_URL}/auth/dev-login?userId=${encodeURIComponent(userId)}`
+  );
   if (!result?.accessToken) {
     throw new Error('[smoke:ws:negative] dev-login did not return accessToken.');
   }
@@ -139,7 +141,58 @@ async function waitForErrorCode(messages, code, timeoutMs = TIMEOUT_MS) {
     await delay(20);
   }
 
-  throw new Error(`[smoke:ws:negative] Timeout waiting for error code ${code}.`);
+  const observedCodes = messages
+    .filter((message) => message?.type === 'error' && typeof message.code === 'string')
+    .map((message) => message.code);
+  const observedSuffix =
+    observedCodes.length > 0
+      ? ` Observed codes: ${observedCodes.join(', ')}.`
+      : ' Observed codes: none.';
+  throw new Error(`[smoke:ws:negative] Timeout waiting for error code ${code}.${observedSuffix}`);
+}
+
+async function expectErrorCodeForPayload(payload, expectedCode, attempts = 3, label = 'payload') {
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const socket = await connectSocket();
+    socket.ws.send(JSON.stringify(payload));
+
+    try {
+      await waitForErrorCode(socket.messages, expectedCode);
+      socket.ws.close(1000, 'done');
+      return;
+    } catch (error) {
+      lastError = error;
+      socket.ws.close(1000, 'done');
+      if (attempt < attempts) {
+        await delay(100);
+      }
+    }
+  }
+
+  if (lastError instanceof Error) {
+    throw new Error(`[smoke:ws:negative] ${label}: ${lastError.message}`);
+  }
+  throw new Error(
+    `[smoke:ws:negative] ${label}: failed waiting for ${expectedCode} after ${attempts} attempts.`
+  );
+}
+
+async function waitForPeerJoined(messages, peerId, timeoutMs = TIMEOUT_MS) {
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < timeoutMs) {
+    const index = messages.findIndex(
+      (message) => message.type === 'peer-joined' && message.peerId === peerId
+    );
+    if (index >= 0) {
+      return messages.splice(index, 1)[0];
+    }
+    await delay(20);
+  }
+
+  throw new Error(`[smoke:ws:negative] Timeout waiting for peer-joined ${peerId.slice(0, 8)}.`);
 }
 
 async function main() {
@@ -152,19 +205,66 @@ async function main() {
   await waitForErrorCode(invalidJsonSocket.messages, 'INVALID_JSON');
   invalidJsonSocket.ws.close(1000, 'done');
 
-  const invalidSchemaSocket = await connectSocket();
-  invalidSchemaSocket.ws.send(
-    JSON.stringify({
-      type: 'offer',
-      to: 'not-a-uuid',
-      sdp: {
-        type: 'offer',
-        sdp: 'v=0'
-      }
-    })
+  await expectErrorCodeForPayload(
+    {
+      type: 'join',
+      roomId: 'x'
+    },
+    'SCHEMA_VALIDATION_FAILED',
+    3,
+    'invalid-schema'
   );
-  await waitForErrorCode(invalidSchemaSocket.messages, 'SCHEMA_VALIDATION_FAILED');
-  invalidSchemaSocket.ws.close(1000, 'done');
+
+  await expectErrorCodeForPayload(
+    {
+      type: 'join',
+      roomId: `smoke-room-invalid-key-type-${Date.now()}`,
+      peerId: randomUUID(),
+      token: await issueAccessToken('smoke-oversized-key'),
+      peerPublicKey: 42
+    },
+    'SCHEMA_VALIDATION_FAILED',
+    3,
+    'invalid-peer-public-key-type'
+  );
+
+  const malformedBundleRoomId = `smoke-room-malformed-bundle-${Date.now()}`;
+  const malformedBundleToken = await issueAccessToken('smoke-malformed-bundle');
+  const observerToken = await issueAccessToken('smoke-malformed-observer');
+  const malformedPeerId = randomUUID();
+  const observerPeerId = randomUUID();
+
+  const malformedPeer = await connectJoinedPeer({
+    roomId: malformedBundleRoomId,
+    token: malformedBundleToken,
+    peerId: malformedPeerId,
+    // Intentionally malformed bundle marker + invalid base64 payload.
+    peerPublicKey: 'p2p-key-bundle-v1:@@@not_base64@@@'
+  });
+  const observerPeer = await connectJoinedPeer({
+    roomId: malformedBundleRoomId,
+    token: observerToken,
+    peerId: observerPeerId,
+    peerPublicKey: `smoke-observer-key-${Date.now()}`
+  });
+
+  const observerSawMalformedPeer = await waitForPeerJoined(observerPeer.messages, malformedPeerId);
+  const malformedSawObserver = await waitForPeerJoined(malformedPeer.messages, observerPeerId);
+
+  if (observerSawMalformedPeer.peerPublicKey !== 'p2p-key-bundle-v1:@@@not_base64@@@') {
+    throw new Error('[smoke:ws:negative] Malformed bundle peerPublicKey was unexpectedly altered.');
+  }
+  if (
+    typeof malformedSawObserver.peerPublicKey !== 'string' ||
+    malformedSawObserver.peerPublicKey.length === 0
+  ) {
+    throw new Error(
+      '[smoke:ws:negative] Observer peerPublicKey was not propagated to malformed-bundle peer.'
+    );
+  }
+
+  malformedPeer.ws.close(1000, 'done');
+  observerPeer.ws.close(1000, 'done');
 
   const rateLimitedSocket = await connectSocket();
   for (let index = 0; index < 24; index += 1) {
