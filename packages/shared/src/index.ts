@@ -2,6 +2,9 @@ import { z } from 'zod';
 
 export const MAX_SIGNALING_MESSAGE_BYTES = 8 * 1024;
 export const MAX_CHAT_MESSAGE_BYTES = 256 * 1024;
+const MAX_SIGNALING_SDP_LENGTH = 7_500;
+const MAX_ICE_CANDIDATE_LENGTH = 4_096;
+const MAX_ICE_USERNAME_FRAGMENT_LENGTH = 256;
 
 export const roomIdSchema = z.string().min(3).max(128);
 export const peerIdSchema = z.string().uuid();
@@ -24,7 +27,7 @@ export const offerMessageSchema = z.object({
   to: peerIdSchema,
   sdp: z.object({
     type: z.enum(['offer', 'pranswer', 'answer', 'rollback']),
-    sdp: z.string().min(1)
+    sdp: z.string().min(1).max(MAX_SIGNALING_SDP_LENGTH)
   })
 });
 
@@ -33,7 +36,7 @@ export const answerMessageSchema = z.object({
   to: peerIdSchema,
   sdp: z.object({
     type: z.enum(['offer', 'pranswer', 'answer', 'rollback']),
-    sdp: z.string().min(1)
+    sdp: z.string().min(1).max(MAX_SIGNALING_SDP_LENGTH)
   })
 });
 
@@ -41,10 +44,10 @@ export const iceCandidateMessageSchema = z.object({
   type: z.literal('ice-candidate'),
   to: peerIdSchema,
   candidate: z.object({
-    candidate: z.string(),
+    candidate: z.string().max(MAX_ICE_CANDIDATE_LENGTH),
     sdpMid: z.string().nullable().optional(),
     sdpMLineIndex: z.number().int().nullable().optional(),
-    usernameFragment: z.string().optional()
+    usernameFragment: z.string().max(MAX_ICE_USERNAME_FRAGMENT_LENGTH).optional()
   })
 });
 
@@ -68,7 +71,7 @@ export const relayedOfferMessageSchema = z.object({
   from: peerIdSchema,
   sdp: z.object({
     type: z.enum(['offer', 'pranswer', 'answer', 'rollback']),
-    sdp: z.string().min(1)
+    sdp: z.string().min(1).max(MAX_SIGNALING_SDP_LENGTH)
   })
 });
 
@@ -77,7 +80,7 @@ export const relayedAnswerMessageSchema = z.object({
   from: peerIdSchema,
   sdp: z.object({
     type: z.enum(['offer', 'pranswer', 'answer', 'rollback']),
-    sdp: z.string().min(1)
+    sdp: z.string().min(1).max(MAX_SIGNALING_SDP_LENGTH)
   })
 });
 
@@ -85,10 +88,10 @@ export const relayedIceCandidateMessageSchema = z.object({
   type: z.literal('ice-candidate'),
   from: peerIdSchema,
   candidate: z.object({
-    candidate: z.string(),
+    candidate: z.string().max(MAX_ICE_CANDIDATE_LENGTH),
     sdpMid: z.string().nullable().optional(),
     sdpMLineIndex: z.number().int().nullable().optional(),
-    usernameFragment: z.string().optional()
+    usernameFragment: z.string().max(MAX_ICE_USERNAME_FRAGMENT_LENGTH).optional()
   })
 });
 

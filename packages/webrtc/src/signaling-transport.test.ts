@@ -137,6 +137,19 @@ describe('SignalingTransport', () => {
     });
   });
 
+  it('returns false for reconnectFromSession when room id is missing', () => {
+    const transport = new SignalingTransport({
+      url: 'ws://localhost:3001/ws',
+      peerId: '14141414-1414-4141-8141-141414141414',
+      peerPublicKey: 'peer-public-key',
+      getToken: async () => 'token'
+    });
+
+    const didReconnect = transport.reconnectFromSession();
+    expect(didReconnect).toBe(false);
+    expect(FakeWebSocket.instances).toHaveLength(0);
+  });
+
   it('exhausts reconnect attempts after exponential backoff', () => {
     const onStatus = vi.fn();
     const onError = vi.fn();
@@ -251,7 +264,7 @@ describe('SignalingTransport', () => {
     expect(onError).toHaveBeenCalled();
   });
 
-  it('clears stored room id on leave', () => {
+  it('clears stored room id on leave', async () => {
     const transport = new SignalingTransport({
       url: 'ws://localhost:3001/ws',
       peerId: '56565656-5656-4565-8565-565656565656',
@@ -262,8 +275,36 @@ describe('SignalingTransport', () => {
     transport.connect('room-leave');
     expect(sessionStorage.getItem('p2p.roomId')).toBe('room-leave');
 
+    const socket = getLastSocket();
+    socket.emitOpen();
+    await Promise.resolve();
     transport.leave();
+
+    expect(socket.sent).toHaveLength(2);
+    expect(JSON.parse(socket.sent[1] as string)).toEqual({
+      type: 'leave',
+      roomId: 'room-leave'
+    });
     expect(sessionStorage.getItem('p2p.roomId')).toBeNull();
+  });
+
+  it('disconnect cancels pending reconnect timer', () => {
+    const transport = new SignalingTransport({
+      url: 'ws://localhost:3001/ws',
+      peerId: '57575757-5757-4575-8575-575757575757',
+      peerPublicKey: 'peer-public-key',
+      getToken: async () => 'token'
+    });
+
+    transport.connect('room-disconnect-reconnect');
+    const firstSocket = getLastSocket();
+
+    firstSocket.emitClose();
+    transport.disconnect();
+    const socketCountAfterDisconnect = FakeWebSocket.instances.length;
+
+    vi.advanceTimersByTime(20_000);
+    expect(FakeWebSocket.instances.length).toBe(socketCountAfterDisconnect);
   });
 
   it('refuses to send oversized outbound relay message', async () => {

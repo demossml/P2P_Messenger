@@ -138,8 +138,15 @@ export class PeerManager {
       return;
     }
 
+    const serialized = JSON.stringify(validated.data);
+    const messageSize = utf8ByteLength(serialized);
+    if (messageSize > MAX_CHAT_MESSAGE_BYTES) {
+      this.onError(new Error(`Outgoing chat message exceeds ${MAX_CHAT_MESSAGE_BYTES} bytes.`));
+      return;
+    }
+
     try {
-      await this.sendWithBackpressure(context.chatChannel, JSON.stringify(validated.data));
+      await this.sendWithBackpressure(context.chatChannel, serialized);
     } catch (error) {
       this.onError(error instanceof Error ? error : new Error('Failed to send chat message.'));
     }

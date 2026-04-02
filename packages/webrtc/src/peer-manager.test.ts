@@ -20,17 +20,58 @@ class FakeDataChannel {
   public onopen: (() => void) | null = null;
   public onclose: (() => void) | null = null;
   public onerror: (() => void) | null = null;
+  public sentPayloads: string[] = [];
+  private readonly listeners = new Map<string, Array<() => void>>();
 
   public constructor(label: string, protocol: string) {
     this.label = label;
     this.protocol = protocol;
   }
 
-  public addEventListener(): void {}
+  public addEventListener(
+    type: string,
+    listener: () => void,
+    options?: AddEventListenerOptions | boolean
+  ): void {
+    const current = this.listeners.get(type) ?? [];
+    if (options && typeof options === 'object' && options.once) {
+      const onceListener = () => {
+        this.removeEventListener(type, onceListener);
+        listener();
+      };
+      current.push(onceListener);
+      this.listeners.set(type, current);
+      return;
+    }
 
-  public removeEventListener(): void {}
+    current.push(listener);
+    this.listeners.set(type, current);
+  }
 
-  public send(): void {}
+  public removeEventListener(type: string, listener: () => void): void {
+    const current = this.listeners.get(type);
+    if (!current) {
+      return;
+    }
+
+    const next = current.filter((candidate) => candidate !== listener);
+    if (next.length === 0) {
+      this.listeners.delete(type);
+      return;
+    }
+    this.listeners.set(type, next);
+  }
+
+  public send(payload: string): void {
+    this.sentPayloads.push(payload);
+  }
+
+  public emit(type: string): void {
+    const current = this.listeners.get(type) ?? [];
+    for (const listener of current) {
+      listener();
+    }
+  }
 
   public close(): void {
     this.readyState = 'closed';
@@ -75,6 +116,7 @@ class FakeRTCPeerConnection {
   public addedCandidates: RTCIceCandidateInit[] = [];
   public restartCount = 0;
   public lastConfiguration: RTCConfiguration | null = null;
+  public lastDataChannel: FakeDataChannel | null = null;
   private readonly senders: Array<{
     track: MediaStreamTrack | null;
     replaceTrack: (track: MediaStreamTrack | null) => Promise<void>;
@@ -86,7 +128,9 @@ class FakeRTCPeerConnection {
   }
 
   public createDataChannel(label: string, options?: RTCDataChannelInit): RTCDataChannel {
-    return new FakeDataChannel(label, options?.protocol ?? '') as unknown as RTCDataChannel;
+    const channel = new FakeDataChannel(label, options?.protocol ?? '');
+    this.lastDataChannel = channel;
+    return channel as unknown as RTCDataChannel;
   }
 
   public addTrack(track: MediaStreamTrack): RTCRtpSender {
@@ -296,5 +340,151 @@ describe('PeerManager', () => {
     expect(onChatMessage).not.toHaveBeenCalled();
     expect(onError).toHaveBeenCalled();
     expect(oversizedButValidMessage.length).toBeGreaterThan(MAX_CHAT_MESSAGE_BYTES);
+  });
+
+  it('waits for bufferedamountlow before sending chat message when channel is saturated', async () => {
+    const manager = new PeerManager({
+      localPeerId: 'peer-z',
+      transport: {
+        send: () => undefined
+      } as never
+    });
+
+    await manager.handleSignalingMessage({
+      type: 'peer-joined',
+      peerId: 'peer-a',
+      peerPublicKey: 'pub'
+    });
+
+    const connection = manager.getConnections()[0]?.connection as unknown as FakeRTCPeerConnection;
+    const channel = connection.lastDataChannel;
+    if (!channel) {
+      throw new Error('Expected initiator chat channel.');
+    }
+
+    channel.bufferedAmount = 1024 * 1024 + 10;
+
+    const sendPromise = manager.sendChatMessage('peer-a', {
+      id: '9d5537c5-4958-41f3-928d-90a41d93334b',
+      timestamp: Date.now(),
+      senderId: '11111111-1111-4111-8111-111111111111',
+      signature: 'sig',
+      payload: {
+        type: 'text',
+        text: 'hello with backpressure'
+      }
+    });
+
+    await Promise.resolve();
+    expect(channel.sentPayloads).toHaveLength(0);
+
+    channel.bufferedAmount = 0;
+    channel.emit('bufferedamountlow');
+
+    await sendPromise;
+    expect(channel.sentPayloads).toHaveLength(1);
+  });
+
+  it('reports timeout when bufferedamountlow does not arrive in time', async () => {
+    vi.useFakeTimers();
+    try {
+      const onError = vi.fn();
+      const manager = new PeerManager({
+        localPeerId: 'peer-z',
+        transport: {
+          send: () => undefined
+        } as never,
+        onError
+      });
+
+      await manager.handleSignalingMessage({
+        type: 'peer-joined',
+        peerId: 'peer-a',
+        peerPublicKey: 'pub'
+      });
+
+      const connection = manager.getConnections()[0]
+        ?.connection as unknown as FakeRTCPeerConnection;
+      const channel = connection.lastDataChannel;
+      if (!channel) {
+        throw new Error('Expected initiator chat channel.');
+      }
+
+      channel.bufferedAmount = 1024 * 1024 + 10;
+
+      const sendPromise = manager.sendChatMessage('peer-a', {
+        id: 'ef50f0a4-152a-4cb4-b914-9f98b8df1f7e',
+        timestamp: Date.now(),
+        senderId: '22222222-2222-4222-8222-222222222222',
+        signature: 'sig',
+        payload: {
+          type: 'text',
+          text: 'timeout path'
+        }
+      });
+
+      await vi.advanceTimersByTimeAsync(5000);
+      await sendPromise;
+
+      expect(channel.sentPayloads).toHaveLength(0);
+      const errorMessages = onError.mock.calls.map(([error]) =>
+        error instanceof Error ? error.message : String(error)
+      );
+      expect(
+        errorMessages.some((message) =>
+          message.includes('Timed out waiting for DataChannel buffer to drain.')
+        )
+      ).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('rejects oversized outbound chat payload before sending to data channel', async () => {
+    const onError = vi.fn();
+    const manager = new PeerManager({
+      localPeerId: 'peer-z',
+      transport: {
+        send: () => undefined
+      } as never,
+      onError
+    });
+
+    await manager.handleSignalingMessage({
+      type: 'peer-joined',
+      peerId: 'peer-a',
+      peerPublicKey: 'pub'
+    });
+
+    const connection = manager.getConnections()[0]?.connection as unknown as FakeRTCPeerConnection;
+    const channel = connection.lastDataChannel;
+    if (!channel) {
+      throw new Error('Expected initiator chat channel.');
+    }
+
+    const oversizedMessage = {
+      id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      timestamp: Date.now(),
+      senderId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+      signature: 'sig',
+      payload: {
+        type: 'file-ack' as const,
+        fileId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+        status: 'accepted' as const,
+        missingChunks: Array.from({ length: 70_000 }, (_, index) => index)
+      }
+    };
+
+    await manager.sendChatMessage('peer-a', oversizedMessage);
+
+    expect(channel.sentPayloads).toHaveLength(0);
+    const errorMessages = onError.mock.calls.map(([error]) =>
+      error instanceof Error ? error.message : String(error)
+    );
+    expect(
+      errorMessages.some((message) =>
+        message.includes(`Outgoing chat message exceeds ${MAX_CHAT_MESSAGE_BYTES} bytes.`)
+      )
+    ).toBe(true);
   });
 });

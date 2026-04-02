@@ -282,12 +282,18 @@ Current e2e scenario:
 - `@p2p/shared` schema tests include encrypted payload boundary checks (`ivBase64`/`ciphertextBase64` limits and invalid field types).
 - Signaling contract tests explicitly cover `join.peerPublicKey` in both legacy string form and `p2p-key-bundle-v1:<base64-json>` form.
 - `peerPublicKey` signaling payload is bounded (`1..4096` chars) and oversized join/broadcast payloads are rejected by schema validation.
+- Signaling schema now also bounds SDP/ICE fields (`sdp <= 7500`, `candidate <= 4096`, `usernameFragment <= 256`) for both inbound and relayed messages, with contract tests for oversized payload rejection.
 - `@p2p/webrtc` has tested utilities for adaptive bitrate (`setVideoBitrate`) and connection-quality assessment (`assessConnectionQuality` for packet loss/RTT/jitter).
 - `SignalingTransport` reconnect logic is hardened and covered by unit tests:
   - exponential backoff exhaustion path
   - reconnect counter reset on manual reconnect
   - stale WebSocket close/error/message events are ignored after socket replacement
+  - reconnect-from-session no-op when stored room id is absent
+  - explicit disconnect cancels pending reconnect timer
+  - leave sends signaling leave message and clears stored room id
 - `PeerManager` now has unit tests for initiator offer flow, queued ICE candidate flush after remote description, and relay-mode ICE restart behavior.
+- `PeerManager` backpressure path is covered by tests: message send waits for `bufferedamountlow` when DataChannel buffer is saturated, and emits timeout error when drain signal never arrives.
+- `PeerManager` now also enforces outbound DataChannel message size cap (`256KB`) before send and reports explicit errors for oversized serialized payloads.
 - Client now consumes WebRTC stats every 2s, surfaces `quality / packet loss / RTT / jitter` in `ConnectionPanel`, and auto-adjusts outgoing video bitrate per peer.
 - Client automatically toggles peer relay mode (`iceTransportPolicy: relay`) via ICE restart when degraded conditions persist, and shows network notices for bitrate/relay transitions.
 - Relay switching on the client uses hysteresis + cooldown to avoid flapping and excessive renegotiation on unstable links.

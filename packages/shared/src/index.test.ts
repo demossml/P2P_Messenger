@@ -51,6 +51,33 @@ describe('signalingInboundSchema', () => {
     expect(parsed.success).toBe(false);
   });
 
+  it('rejects offer with oversized sdp', () => {
+    const parsed = signalingInboundSchema.safeParse({
+      type: 'offer',
+      to: '11111111-1111-4111-8111-111111111111',
+      sdp: {
+        type: 'offer',
+        sdp: 'v=0\r\n'.padEnd(7_501, 'x')
+      }
+    });
+
+    expect(parsed.success).toBe(false);
+  });
+
+  it('rejects ice-candidate with oversized candidate string', () => {
+    const parsed = signalingInboundSchema.safeParse({
+      type: 'ice-candidate',
+      to: '11111111-1111-4111-8111-111111111111',
+      candidate: {
+        candidate: 'x'.repeat(4_097),
+        sdpMid: '0',
+        sdpMLineIndex: 0
+      }
+    });
+
+    expect(parsed.success).toBe(false);
+  });
+
   it('rejects join with oversized peerPublicKey', () => {
     const parsed = signalingInboundSchema.safeParse({
       type: 'join',
@@ -80,6 +107,34 @@ describe('signalingOutboundSchema', () => {
       type: 'peer-joined',
       peerId: '11111111-1111-4111-8111-111111111111',
       peerPublicKey: 'x'.repeat(4097)
+    });
+
+    expect(parsed.success).toBe(false);
+  });
+
+  it('rejects relayed answer with oversized sdp', () => {
+    const parsed = signalingOutboundSchema.safeParse({
+      type: 'answer',
+      from: '11111111-1111-4111-8111-111111111111',
+      sdp: {
+        type: 'answer',
+        sdp: 'x'.repeat(7_501)
+      }
+    });
+
+    expect(parsed.success).toBe(false);
+  });
+
+  it('rejects relayed ice-candidate with oversized usernameFragment', () => {
+    const parsed = signalingOutboundSchema.safeParse({
+      type: 'ice-candidate',
+      from: '11111111-1111-4111-8111-111111111111',
+      candidate: {
+        candidate: 'candidate:1 1 UDP 2122252543 192.168.1.2 12345 typ host',
+        sdpMid: '0',
+        sdpMLineIndex: 0,
+        usernameFragment: 'x'.repeat(257)
+      }
     });
 
     expect(parsed.success).toBe(false);

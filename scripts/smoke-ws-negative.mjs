@@ -6,6 +6,7 @@ const SIGNALING_WS_URL = process.env.P2P_SIGNALING_WS_URL ?? 'ws://127.0.0.1:300
 const ORIGIN = process.env.P2P_ALLOWED_ORIGIN ?? 'http://localhost:5173';
 const EXPECTED_ROOM_MAX_PEERS = Number(process.env.P2P_EXPECT_ROOM_MAX_PEERS ?? 8);
 const TIMEOUT_MS = 8000;
+const MAX_SIGNALING_MESSAGE_BYTES = 8 * 1024;
 
 function delay(ms) {
   return new Promise((resolve) => {
@@ -113,6 +114,48 @@ function expectOriginRejectedConnection() {
   });
 }
 
+function expectOversizedPayloadRejected() {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(SIGNALING_WS_URL, {
+      headers: {
+        Origin: ORIGIN
+      }
+    });
+
+    const timeoutId = setTimeout(() => {
+      reject(new Error('[smoke:ws:negative] Timeout waiting for oversized payload rejection.'));
+      ws.terminate();
+    }, TIMEOUT_MS);
+
+    ws.on('open', () => {
+      const oversizedOffer = JSON.stringify({
+        type: 'offer',
+        to: randomUUID(),
+        sdp: {
+          type: 'offer',
+          sdp: 'x'.repeat(MAX_SIGNALING_MESSAGE_BYTES + 2048)
+        }
+      });
+      ws.send(oversizedOffer);
+    });
+
+    ws.on('close', () => {
+      clearTimeout(timeoutId);
+      resolve();
+    });
+
+    ws.on('unexpected-response', () => {
+      clearTimeout(timeoutId);
+      resolve();
+    });
+
+    ws.on('error', () => {
+      // For oversized frames some runtimes emit error before/after close.
+      // We still treat this path as rejection success.
+    });
+  });
+}
+
 async function connectJoinedPeer({ roomId, token, peerId, peerPublicKey }) {
   const connected = await connectSocket();
   connected.ws.send(
@@ -199,6 +242,7 @@ async function main() {
   const startedAt = Date.now();
 
   await expectOriginRejectedConnection();
+  await expectOversizedPayloadRejected();
 
   const invalidJsonSocket = await connectSocket();
   invalidJsonSocket.ws.send('{');
