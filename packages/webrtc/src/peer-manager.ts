@@ -16,9 +16,14 @@ export type PeerManagerOptions = {
 type PeerContext = {
   connection: RTCPeerConnection;
   pendingCandidates: SignaledIceCandidate[];
+  outgoingCandidates: SignaledIceCandidate[];
+  candidateFlushTimerId: number | null;
   remoteStream: MediaStream;
   chatChannel?: RTCDataChannel;
-  connectedNotified: boolean;
+  queuedChatPayloads: string[];
+  negotiationInFlight: boolean;
+  negotiationRetryTimerId: number | null;
+  lastOfferAt: number;
 };
 
 type SignaledIceCandidate = Extract<
@@ -26,6 +31,8 @@ type SignaledIceCandidate = Extract<
   { type: 'ice-candidate' }
 >['candidate'];
 const MAX_CHAT_MESSAGE_BYTES = 256 * 1024;
+const OFFER_MIN_INTERVAL_MS = 1500;
+const CANDIDATE_FLUSH_INTERVAL_MS = 220;
 
 function utf8ByteLength(value: string): number {
   if (typeof TextEncoder !== 'undefined') {
@@ -37,6 +44,7 @@ function utf8ByteLength(value: string): number {
 
 export class PeerManager {
   private readonly peers = new Map<string, PeerContext>();
+  private readonly disconnectTimers = new Map<string, number>();
   private localStream: MediaStream | null = null;
   private relayModeEnabled = false;
 
@@ -138,22 +146,11 @@ export class PeerManager {
       return false;
     }
 
-    if (chatChannel.readyState === 'connecting') {
-      const opened = await this.waitForChatChannelOpen(chatChannel, 5000);
-      if (!opened) {
-        this.onError(new Error(`Timed out waiting for chat channel open for peer ${peerId}.`));
-        return false;
-      }
-    }
-
-    if (chatChannel.readyState !== 'open') {
-      this.onError(new Error(`Chat channel is not open for peer ${peerId}.`));
-      return false;
-    }
-
     const validated = chatMessageSchema.safeParse(message);
     if (!validated.success) {
-      this.onError(new Error('Outgoing chat message has invalid schema.'));
+      const issue = validated.error.issues[0];
+      const details = issue ? ` (${issue.path.join('.') || 'root'}: ${issue.message})` : '';
+      this.onError(new Error(`Outgoing chat message has invalid schema.${details}`));
       return false;
     }
 
@@ -162,6 +159,11 @@ export class PeerManager {
     if (messageSize > MAX_CHAT_MESSAGE_BYTES) {
       this.onError(new Error(`Outgoing chat message exceeds ${MAX_CHAT_MESSAGE_BYTES} bytes.`));
       return false;
+    }
+
+    if (chatChannel.readyState !== 'open') {
+      this.enqueueChatPayload(context, serialized);
+      return true;
     }
 
     try {
@@ -182,6 +184,10 @@ export class PeerManager {
   public hasOpenChatChannel(peerId: string): boolean {
     const channel = this.peers.get(peerId)?.chatChannel;
     return Boolean(channel && channel.readyState === 'open');
+  }
+
+  public getChatChannelState(peerId: string): RTCDataChannelState | null {
+    return this.peers.get(peerId)?.chatChannel?.readyState ?? null;
   }
 
   public getConnections(): Array<{ peerId: string; connection: RTCPeerConnection }> {
@@ -212,7 +218,7 @@ export class PeerManager {
         );
       }
 
-      await this.restartIce(peerId, context.connection);
+      await this.restartIce(peerId, context.connection, { force: true });
     }
   }
 
@@ -239,8 +245,13 @@ export class PeerManager {
     const context: PeerContext = {
       connection,
       pendingCandidates: [],
+      outgoingCandidates: [],
+      candidateFlushTimerId: null,
       remoteStream,
-      connectedNotified: false
+      queuedChatPayloads: [],
+      negotiationInFlight: false,
+      negotiationRetryTimerId: null,
+      lastOfferAt: 0
     };
 
     this.attachConnectionHandlers(remotePeerId, context);
@@ -254,7 +265,7 @@ export class PeerManager {
     }
     this.attachLocalTracks(connection);
     this.peers.set(remotePeerId, context);
-    this.notifyPeerConnectedIfReady(remotePeerId, context);
+    this.onPeerConnected(remotePeerId);
 
     if (createOffer) {
       await this.createAndSendOffer(remotePeerId, connection);
@@ -271,11 +282,8 @@ export class PeerManager {
         return;
       }
 
-      this.options.transport.send({
-        type: 'ice-candidate',
-        to: remotePeerId,
-        candidate: this.normalizeIceCandidate(event.candidate)
-      });
+      context.outgoingCandidates.push(this.normalizeIceCandidate(event.candidate));
+      this.scheduleCandidateFlush(remotePeerId, context);
     };
 
     connection.ontrack = (event) => {
@@ -287,13 +295,30 @@ export class PeerManager {
     };
 
     connection.onconnectionstatechange = () => {
-      if (
-        connection.connectionState === 'closed' ||
-        connection.connectionState === 'failed' ||
-        connection.connectionState === 'disconnected'
-      ) {
+      if (connection.connectionState === 'closed' || connection.connectionState === 'failed') {
+        this.clearDisconnectTimer(remotePeerId);
         this.closePeer(remotePeerId);
+        return;
       }
+
+      if (connection.connectionState === 'disconnected') {
+        this.clearDisconnectTimer(remotePeerId);
+        const timerId = window.setTimeout(() => {
+          this.disconnectTimers.delete(remotePeerId);
+          const latest = this.peers.get(remotePeerId);
+          if (!latest) {
+            return;
+          }
+
+          if (latest.connection.connectionState === 'disconnected') {
+            this.closePeer(remotePeerId);
+          }
+        }, 5000);
+        this.disconnectTimers.set(remotePeerId, timerId);
+        return;
+      }
+
+      this.clearDisconnectTimer(remotePeerId);
     };
 
     connection.ondatachannel = (event) => {
@@ -301,9 +326,11 @@ export class PeerManager {
         return;
       }
 
-      context.chatChannel = event.channel;
+      const currentChannel = context.chatChannel;
+      if (!currentChannel || currentChannel.readyState !== 'open') {
+        context.chatChannel = event.channel;
+      }
       this.attachChatChannelHandlers(remotePeerId, event.channel);
-      this.notifyPeerConnectedIfReady(remotePeerId, context);
     };
   }
 
@@ -327,10 +354,32 @@ export class PeerManager {
     remotePeerId: string,
     connection: RTCPeerConnection
   ): Promise<void> {
-    await this.restartIce(remotePeerId, connection);
+    await this.restartIce(remotePeerId, connection, { force: false });
   }
 
-  private async restartIce(remotePeerId: string, connection: RTCPeerConnection): Promise<void> {
+  private async restartIce(
+    remotePeerId: string,
+    connection: RTCPeerConnection,
+    options?: { force?: boolean }
+  ): Promise<void> {
+    const context = this.peers.get(remotePeerId);
+    if (!context || context.connection !== connection) {
+      return;
+    }
+
+    if (context.negotiationInFlight) {
+      this.scheduleNegotiationRetry(remotePeerId, context, OFFER_MIN_INTERVAL_MS);
+      return;
+    }
+
+    const now = Date.now();
+    if (!options?.force && now - context.lastOfferAt < OFFER_MIN_INTERVAL_MS) {
+      const delayMs = OFFER_MIN_INTERVAL_MS - (now - context.lastOfferAt);
+      this.scheduleNegotiationRetry(remotePeerId, context, delayMs);
+      return;
+    }
+
+    context.negotiationInFlight = true;
     try {
       if (typeof connection.restartIce === 'function') {
         connection.restartIce();
@@ -348,8 +397,11 @@ export class PeerManager {
         to: remotePeerId,
         sdp: connection.localDescription
       });
+      context.lastOfferAt = Date.now();
     } catch (error) {
       this.onError(error instanceof Error ? error : new Error('Failed to create offer.'));
+    } finally {
+      context.negotiationInFlight = false;
     }
   }
 
@@ -371,6 +423,12 @@ export class PeerManager {
     const context = await this.ensurePeerConnection(remotePeerId, false);
 
     try {
+      const signalingState = context.connection.signalingState;
+      if (signalingState === 'have-local-offer' || signalingState === 'have-local-pranswer') {
+        // Glare handling: abandon local in-flight offer before accepting remote offer.
+        await context.connection.setLocalDescription({ type: 'rollback' });
+      }
+
       await context.connection.setRemoteDescription(sdp);
 
       for (const candidate of context.pendingCandidates.splice(0)) {
@@ -440,6 +498,10 @@ export class PeerManager {
       return;
     }
 
+    this.clearDisconnectTimer(peerId);
+    this.clearCandidateFlushTimer(context);
+    this.clearNegotiationRetryTimer(context);
+
     context.connection.onicecandidate = null;
     context.connection.ontrack = null;
     context.connection.onconnectionstatechange = null;
@@ -455,6 +517,83 @@ export class PeerManager {
 
     this.peers.delete(peerId);
     this.onPeerDisconnected(peerId);
+  }
+
+  private clearDisconnectTimer(peerId: string): void {
+    const timerId = this.disconnectTimers.get(peerId);
+    if (timerId !== undefined) {
+      window.clearTimeout(timerId);
+      this.disconnectTimers.delete(peerId);
+    }
+  }
+
+  private scheduleNegotiationRetry(peerId: string, context: PeerContext, delayMs: number): void {
+    if (context.negotiationRetryTimerId !== null) {
+      return;
+    }
+
+    context.negotiationRetryTimerId = window.setTimeout(
+      () => {
+        context.negotiationRetryTimerId = null;
+        const latest = this.peers.get(peerId);
+        if (!latest || latest.connection.connectionState === 'closed') {
+          return;
+        }
+
+        void this.restartIce(peerId, latest.connection, { force: false });
+      },
+      Math.max(50, delayMs)
+    );
+  }
+
+  private clearNegotiationRetryTimer(context: PeerContext): void {
+    if (context.negotiationRetryTimerId === null) {
+      return;
+    }
+
+    window.clearTimeout(context.negotiationRetryTimerId);
+    context.negotiationRetryTimerId = null;
+  }
+
+  private scheduleCandidateFlush(peerId: string, context: PeerContext): void {
+    if (context.candidateFlushTimerId !== null) {
+      return;
+    }
+
+    context.candidateFlushTimerId = window.setTimeout(() => {
+      context.candidateFlushTimerId = null;
+      const latest = this.peers.get(peerId);
+      if (!latest) {
+        return;
+      }
+
+      this.flushOneCandidate(peerId, latest);
+      if (latest.outgoingCandidates.length > 0) {
+        this.scheduleCandidateFlush(peerId, latest);
+      }
+    }, CANDIDATE_FLUSH_INTERVAL_MS);
+  }
+
+  private flushOneCandidate(peerId: string, context: PeerContext): void {
+    const candidate = context.outgoingCandidates.shift();
+    if (!candidate) {
+      return;
+    }
+
+    this.options.transport.send({
+      type: 'ice-candidate',
+      to: peerId,
+      candidate
+    });
+  }
+
+  private clearCandidateFlushTimer(context: PeerContext): void {
+    if (context.candidateFlushTimerId === null) {
+      return;
+    }
+
+    window.clearTimeout(context.candidateFlushTimerId);
+    context.candidateFlushTimerId = null;
   }
 
   private normalizeIceCandidate(candidate: RTCIceCandidate): SignaledIceCandidate {
@@ -506,7 +645,7 @@ export class PeerManager {
         return;
       }
 
-      this.notifyPeerConnectedIfReady(peerId, context);
+      void this.flushQueuedChatPayloads(peerId, context, channel);
     };
 
     channel.onmessage = (event) => {
@@ -542,27 +681,10 @@ export class PeerManager {
       this.onError(new Error(`Chat channel error for peer ${peerId}.`));
     };
 
-    channel.onclose = () => {
-      this.closePeer(peerId);
-    };
-
     const context = this.peers.get(peerId);
-    if (context) {
-      this.notifyPeerConnectedIfReady(peerId, context);
+    if (context && channel.readyState === 'open') {
+      void this.flushQueuedChatPayloads(peerId, context, channel);
     }
-  }
-
-  private notifyPeerConnectedIfReady(peerId: string, context: PeerContext): void {
-    if (context.connectedNotified) {
-      return;
-    }
-
-    if (!context.chatChannel || context.chatChannel.readyState !== 'open') {
-      return;
-    }
-
-    context.connectedNotified = true;
-    this.onPeerConnected(peerId);
   }
 
   private async sendWithBackpressure(channel: RTCDataChannel, payload: string): Promise<void> {
@@ -601,8 +723,7 @@ export class PeerManager {
       });
       context.chatChannel = channel;
       this.attachChatChannelHandlers(peerId, channel);
-      this.notifyPeerConnectedIfReady(peerId, context);
-      await this.restartIce(peerId, context.connection);
+      await this.restartIce(peerId, context.connection, { force: true });
       return channel;
     } catch (error) {
       this.onError(
@@ -612,43 +733,44 @@ export class PeerManager {
     }
   }
 
-  private async waitForChatChannelOpen(
-    channel: RTCDataChannel,
-    timeoutMs: number
-  ): Promise<boolean> {
-    if (channel.readyState === 'open') {
-      return true;
+  private enqueueChatPayload(context: PeerContext, payload: string): void {
+    const maxQueuedPayloads = 200;
+    if (context.queuedChatPayloads.length >= maxQueuedPayloads) {
+      context.queuedChatPayloads.shift();
+    }
+    context.queuedChatPayloads.push(payload);
+  }
+
+  private async flushQueuedChatPayloads(
+    peerId: string,
+    context: PeerContext,
+    channel: RTCDataChannel
+  ): Promise<void> {
+    if (channel.readyState !== 'open') {
+      return;
     }
 
-    if (channel.readyState !== 'connecting') {
-      return false;
+    while (context.queuedChatPayloads.length > 0) {
+      if (context.chatChannel !== channel || channel.readyState !== 'open') {
+        return;
+      }
+
+      const payload = context.queuedChatPayloads.shift();
+      if (!payload) {
+        return;
+      }
+
+      try {
+        await this.sendWithBackpressure(channel, payload);
+      } catch (error) {
+        this.onError(
+          error instanceof Error
+            ? error
+            : new Error(`Failed to flush queued chat messages for peer ${peerId}.`)
+        );
+        context.queuedChatPayloads.unshift(payload);
+        return;
+      }
     }
-
-    return await new Promise<boolean>((resolve) => {
-      const timeoutId = window.setTimeout(() => {
-        channel.removeEventListener('open', onOpen);
-        channel.removeEventListener('close', onClose);
-        resolve(false);
-      }, timeoutMs);
-
-      const clear = () => {
-        window.clearTimeout(timeoutId);
-        channel.removeEventListener('open', onOpen);
-        channel.removeEventListener('close', onClose);
-      };
-
-      const onOpen = () => {
-        clear();
-        resolve(true);
-      };
-
-      const onClose = () => {
-        clear();
-        resolve(false);
-      };
-
-      channel.addEventListener('open', onOpen, { once: true });
-      channel.addEventListener('close', onClose, { once: true });
-    });
   }
 }

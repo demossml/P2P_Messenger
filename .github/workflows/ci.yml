@@ -13,12 +13,17 @@ on:
         default: smoke-and-e2e
         type: choice
         options:
+          - smoke-http-security
+          - auth-smoke-only
+          - auth-audit-only
           - smoke-only
           - ws-strict-only
           - smoke-minimal
           - e2e-minimal
+          - e2e-reconnect-only
           - e2e-only
           - e2e-full-retry
+          - validate-security
           - validate-fast
           - validate-full
           - release-readiness
@@ -142,7 +147,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Install Playwright browser
-        if: ${{ github.event.inputs.validation != 'smoke-only' && github.event.inputs.validation != 'ws-strict-only' && github.event.inputs.validation != 'release-readiness' && github.event.inputs.validation != 'release-readiness-live' && github.event.inputs.validation != 'pre-release-full' && github.event.inputs.validation != 'pre-release-live' }}
+        if: ${{ github.event.inputs.validation != 'smoke-http-security' && github.event.inputs.validation != 'auth-smoke-only' && github.event.inputs.validation != 'auth-audit-only' && github.event.inputs.validation != 'smoke-only' && github.event.inputs.validation != 'ws-strict-only' && github.event.inputs.validation != 'validate-security' && github.event.inputs.validation != 'release-readiness' && github.event.inputs.validation != 'release-readiness-live' && github.event.inputs.validation != 'pre-release-full' && github.event.inputs.validation != 'pre-release-live' }}
         run: pnpm exec playwright install chromium
 
       - name: Setup k6
@@ -179,13 +184,19 @@ jobs:
 
       - name: Run smoke suite
         id: smoke_suite
-        if: ${{ github.event.inputs.validation == 'smoke-only' || github.event.inputs.validation == 'ws-strict-only' || github.event.inputs.validation == 'smoke-minimal' || github.event.inputs.validation == 'smoke-and-e2e' || github.event.inputs.validation == 'smoke-e2e-k6' }}
+        if: ${{ github.event.inputs.validation == 'smoke-http-security' || github.event.inputs.validation == 'auth-smoke-only' || github.event.inputs.validation == 'auth-audit-only' || github.event.inputs.validation == 'smoke-only' || github.event.inputs.validation == 'ws-strict-only' || github.event.inputs.validation == 'smoke-minimal' || github.event.inputs.validation == 'smoke-and-e2e' || github.event.inputs.validation == 'smoke-e2e-k6' }}
         run: |
           START_TS=$(date +%s)
           echo "$START_TS" > /tmp/smoke_suite_start_ts
 
           set +e
-          if [ "${{ github.event.inputs.validation }}" = "ws-strict-only" ]; then
+          if [ "${{ github.event.inputs.validation }}" = "smoke-http-security" ]; then
+            pnpm smoke:http:security
+          elif [ "${{ github.event.inputs.validation }}" = "auth-smoke-only" ]; then
+            pnpm smoke:auth:retry
+          elif [ "${{ github.event.inputs.validation }}" = "auth-audit-only" ]; then
+            pnpm smoke:auth:audit-only:retry
+          elif [ "${{ github.event.inputs.validation }}" = "ws-strict-only" ]; then
             pnpm smoke:ws:strict
           elif [ "${{ github.event.inputs.validation }}" = "smoke-minimal" ]; then
             pnpm smoke:minimal:retry
@@ -200,6 +211,166 @@ jobs:
           echo "$((END_TS - START_TS))" > /tmp/smoke_suite_duration_s
 
           exit $STATUS
+
+      - name: Render auth-smoke-only summary
+        if: ${{ always() && github.event.inputs.validation == 'auth-smoke-only' }}
+        run: |
+          OUTCOME="${{ steps.smoke_suite.outcome }}"
+          DURATION_S="n/a"
+          if [ -f /tmp/smoke_suite_duration_s ]; then
+            DURATION_S="$(cat /tmp/smoke_suite_duration_s)s"
+          fi
+
+          echo "### Auth Smoke Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Outcome | \`$OUTCOME\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Duration | \`$DURATION_S\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Pipeline | \`smoke:auth:retry (smoke:auth:lifecycle-only -> smoke:auth:reuse-only)\` |" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$OUTCOME" != "success" ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Failure hints:" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Start local runtime: \`pnpm dev:all\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Re-run auth smoke with retry: \`pnpm smoke:auth:retry\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Re-run auth smoke without retry: \`pnpm smoke:auth\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Isolate lifecycle-only check: \`pnpm smoke:auth:lifecycle-only\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Isolate reuse-only check: \`pnpm smoke:auth:reuse-only\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Verify health endpoint: \`curl -fsS http://127.0.0.1:3001/health\`" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Render auth-smoke JSON summary
+        if: ${{ always() && github.event.inputs.validation == 'auth-smoke-only' }}
+        run: |
+          SUMMARY_FILE="artifacts/security/auth-smoke-summary.json"
+          OUTCOME="${{ steps.smoke_suite.outcome }}"
+          DURATION_S="n/a"
+          if [ -f /tmp/smoke_suite_duration_s ]; then
+            DURATION_S="$(cat /tmp/smoke_suite_duration_s)s"
+          fi
+          echo "### Auth Smoke Step Details" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f "$SUMMARY_FILE" ]; then
+            node scripts/render-auth-smoke-summary.mjs "$SUMMARY_FILE" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+            echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Summary file | \`missing\` |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Expected path | \`$SUMMARY_FILE\` |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Smoke suite outcome | \`$OUTCOME\` |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Smoke suite duration | \`$DURATION_S\` |" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Troubleshooting:" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Ensure \`scripts/smoke-auth.mjs\` completed its summary write path." >> "$GITHUB_STEP_SUMMARY"
+            echo "- Re-run locally: \`pnpm smoke:auth\` and confirm \`artifacts/security/auth-smoke-summary.json\` exists." >> "$GITHUB_STEP_SUMMARY"
+            echo "- Check runtime logs artifact for early process termination before summary write." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Render auth-audit-only summary
+        if: ${{ always() && github.event.inputs.validation == 'auth-audit-only' }}
+        run: |
+          OUTCOME="${{ steps.smoke_suite.outcome }}"
+          DURATION_S="n/a"
+          if [ -f /tmp/smoke_suite_duration_s ]; then
+            DURATION_S="$(cat /tmp/smoke_suite_duration_s)s"
+          fi
+
+          echo "### Auth Audit Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Outcome | \`$OUTCOME\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Duration | \`$DURATION_S\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Pipeline | \`smoke:auth:audit-only:retry\` |" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$OUTCOME" != "success" ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Failure hints:" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Start local runtime: \`pnpm dev:all\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Re-run auth-audit smoke with retry: \`pnpm smoke:auth:audit-only:retry\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Re-run auth-audit smoke without retry: \`pnpm smoke:auth:audit-only\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Verify protected endpoint: \`GET /auth/audit?limit=20\` with bearer access token" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Verify health endpoint: \`curl -fsS http://127.0.0.1:3001/health\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Inspect uploaded runtime logs: \`/tmp/signaling.log\`, \`/tmp/client.log\`" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Render auth-audit JSON summary
+        if: ${{ always() && github.event.inputs.validation == 'auth-audit-only' }}
+        run: |
+          SUMMARY_FILE="artifacts/security/auth-audit-smoke-summary.json"
+          OUTCOME="${{ steps.smoke_suite.outcome }}"
+          DURATION_S="n/a"
+          if [ -f /tmp/smoke_suite_duration_s ]; then
+            DURATION_S="$(cat /tmp/smoke_suite_duration_s)s"
+          fi
+          echo "### Auth Audit Step Details" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f "$SUMMARY_FILE" ]; then
+            node scripts/render-auth-audit-summary.mjs "$SUMMARY_FILE" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+            echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Summary file | \`missing\` |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Expected path | \`$SUMMARY_FILE\` |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Smoke suite outcome | \`$OUTCOME\` |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Smoke suite duration | \`$DURATION_S\` |" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Troubleshooting:" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Ensure \`scripts/smoke-auth-audit-only.mjs\` completed its summary write path." >> "$GITHUB_STEP_SUMMARY"
+            echo "- Re-run locally: \`pnpm smoke:auth:audit-only\` and confirm \`artifacts/security/auth-audit-smoke-summary.json\` exists." >> "$GITHUB_STEP_SUMMARY"
+            echo "- Check runtime logs artifact for early process termination before summary write." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Render smoke-http-security summary
+        if: ${{ always() && github.event.inputs.validation == 'smoke-http-security' }}
+        run: |
+          OUTCOME="${{ steps.smoke_suite.outcome }}"
+          DURATION_S="n/a"
+          if [ -f /tmp/smoke_suite_duration_s ]; then
+            DURATION_S="$(cat /tmp/smoke_suite_duration_s)s"
+          fi
+
+          echo "### Smoke HTTP Security Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Outcome | \`$OUTCOME\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Duration | \`$DURATION_S\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Pipeline | \`smoke:http:security\` |" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$OUTCOME" != "success" ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Failure hints:" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Start local runtime: \`pnpm dev:all\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Re-run HTTP security smoke locally: \`pnpm smoke:http:security\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Verify health endpoint: \`curl -fsS http://127.0.0.1:3001/health\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Inspect uploaded runtime logs: \`/tmp/signaling.log\`, \`/tmp/client.log\`" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Render smoke-http-security JSON summary
+        if: ${{ always() && github.event.inputs.validation == 'smoke-http-security' }}
+        run: |
+          SUMMARY_FILE="artifacts/security/smoke-http-security-summary.json"
+          OUTCOME="${{ steps.smoke_suite.outcome }}"
+          DURATION_S="n/a"
+          if [ -f /tmp/smoke_suite_duration_s ]; then
+            DURATION_S="$(cat /tmp/smoke_suite_duration_s)s"
+          fi
+          echo "### Smoke HTTP Security Step Details" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f "$SUMMARY_FILE" ]; then
+            node scripts/render-smoke-http-summary.mjs "$SUMMARY_FILE" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+            echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Summary file | \`missing\` |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Expected path | \`$SUMMARY_FILE\` |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Smoke suite outcome | \`$OUTCOME\` |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Smoke suite duration | \`$DURATION_S\` |" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Troubleshooting:" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Ensure \`scripts/smoke-http.mjs\` completed its summary write path." >> "$GITHUB_STEP_SUMMARY"
+            echo "- Re-run locally: \`pnpm smoke:http:security\` and confirm \`artifacts/security/smoke-http-security-summary.json\` exists." >> "$GITHUB_STEP_SUMMARY"
+            echo "- Check runtime logs artifact for early process termination before summary write." >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Render ws-strict-only summary
         if: ${{ always() && github.event.inputs.validation == 'ws-strict-only' }}
@@ -269,7 +440,7 @@ jobs:
           echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
           echo "| Outcome | \`$OUTCOME\` |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Duration | \`$DURATION_S\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Pipeline | \`smoke:http -> smoke:ws -> smoke:ws:limits -> smoke:ws:negative\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Pipeline | \`smoke:http -> smoke:auth -> smoke:ws -> smoke:ws:limits -> smoke:ws:negative\` |" >> "$GITHUB_STEP_SUMMARY"
           if [ "$OUTCOME" != "success" ]; then
             echo "" >> "$GITHUB_STEP_SUMMARY"
             echo "Failure hints:" >> "$GITHUB_STEP_SUMMARY"
@@ -281,7 +452,7 @@ jobs:
 
       - name: Run e2e suite
         id: e2e_suite
-        if: ${{ github.event.inputs.validation == 'e2e-minimal' || github.event.inputs.validation == 'e2e-only' || github.event.inputs.validation == 'e2e-full-retry' || github.event.inputs.validation == 'smoke-and-e2e' || github.event.inputs.validation == 'smoke-e2e-k6' }}
+        if: ${{ github.event.inputs.validation == 'e2e-minimal' || github.event.inputs.validation == 'e2e-reconnect-only' || github.event.inputs.validation == 'e2e-only' || github.event.inputs.validation == 'e2e-full-retry' || github.event.inputs.validation == 'smoke-and-e2e' || github.event.inputs.validation == 'smoke-e2e-k6' }}
         run: |
           START_TS=$(date +%s)
           echo "$START_TS" > /tmp/e2e_suite_start_ts
@@ -289,6 +460,8 @@ jobs:
           set +e
           if [ "${{ github.event.inputs.validation }}" = "e2e-minimal" ]; then
             pnpm e2e:minimal:retry
+          elif [ "${{ github.event.inputs.validation }}" = "e2e-reconnect-only" ]; then
+            pnpm e2e:reconnect
           elif [ "${{ github.event.inputs.validation }}" = "e2e-full-retry" ]; then
             pnpm e2e:retry
           else
@@ -304,7 +477,7 @@ jobs:
           exit $STATUS
 
       - name: Render e2e-only summary
-        if: ${{ always() && (github.event.inputs.validation == 'e2e-minimal' || github.event.inputs.validation == 'e2e-only' || github.event.inputs.validation == 'e2e-full-retry') }}
+        if: ${{ always() && (github.event.inputs.validation == 'e2e-minimal' || github.event.inputs.validation == 'e2e-reconnect-only' || github.event.inputs.validation == 'e2e-only' || github.event.inputs.validation == 'e2e-full-retry') }}
         run: |
           OUTCOME="${{ steps.e2e_suite.outcome }}"
           DURATION_S="n/a"
@@ -315,6 +488,8 @@ jobs:
           PIPELINE="e2e"
           if [ "${{ github.event.inputs.validation }}" = "e2e-minimal" ]; then
             PIPELINE="e2e:minimal:retry"
+          elif [ "${{ github.event.inputs.validation }}" = "e2e-reconnect-only" ]; then
+            PIPELINE="e2e:reconnect"
           elif [ "${{ github.event.inputs.validation }}" = "e2e-full-retry" ]; then
             PIPELINE="e2e:retry"
           fi
@@ -331,6 +506,7 @@ jobs:
             echo "Failure hints:" >> "$GITHUB_STEP_SUMMARY"
             echo "- Start local runtime: \`pnpm dev:all\`" >> "$GITHUB_STEP_SUMMARY"
             echo "- Re-run minimal browser flow: \`pnpm e2e:minimal:retry\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Re-run reconnect browser flow: \`pnpm e2e:reconnect\`" >> "$GITHUB_STEP_SUMMARY"
             echo "- Re-run full browser flow with retry: \`pnpm e2e:retry\`" >> "$GITHUB_STEP_SUMMARY"
             echo "- Ensure browser is installed: \`pnpm exec playwright install chromium\`" >> "$GITHUB_STEP_SUMMARY"
             echo "- Inspect artifacts: \`playwright-report\`, \`test-results\`, runtime logs" >> "$GITHUB_STEP_SUMMARY"
@@ -475,7 +651,7 @@ jobs:
           echo "| E2E outcome | \`$E2E_OUTCOME\` |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Smoke duration | \`$SMOKE_DURATION_S\` |" >> "$GITHUB_STEP_SUMMARY"
           echo "| E2E duration | \`$E2E_DURATION_S\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Pipeline | \`smoke:all -> e2e\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Pipeline | \`smoke:http -> smoke:auth -> smoke:ws -> smoke:ws:limits -> smoke:ws:negative -> e2e\` |" >> "$GITHUB_STEP_SUMMARY"
           if [ "$OVERALL_OUTCOME" != "success" ]; then
             echo "" >> "$GITHUB_STEP_SUMMARY"
             echo "Failure hints:" >> "$GITHUB_STEP_SUMMARY"
@@ -520,7 +696,7 @@ jobs:
           echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
           echo "| Outcome | \`$OUTCOME\` |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Duration | \`$DURATION_S\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Pipeline | \`smoke:all -> e2e:retry -> lint -> typecheck\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Pipeline | \`smoke:http -> smoke:auth -> smoke:ws -> smoke:ws:limits -> smoke:ws:negative -> e2e:retry -> lint -> typecheck\` |" >> "$GITHUB_STEP_SUMMARY"
           if [ "$OUTCOME" != "success" ]; then
             echo "" >> "$GITHUB_STEP_SUMMARY"
             echo "Failure hints:" >> "$GITHUB_STEP_SUMMARY"
@@ -548,6 +724,77 @@ jobs:
           echo "$((END_TS - START_TS))" > /tmp/validate_fast_duration_s
 
           exit $STATUS
+
+      - name: Run security validation pipeline
+        id: validate_security
+        if: ${{ github.event.inputs.validation == 'validate-security' }}
+        run: |
+          START_TS=$(date +%s)
+          echo "$START_TS" > /tmp/validate_security_start_ts
+
+          set +e
+          pnpm validate:security:retry
+          STATUS=$?
+          set -e
+
+          END_TS=$(date +%s)
+          echo "$END_TS" > /tmp/validate_security_end_ts
+          echo "$((END_TS - START_TS))" > /tmp/validate_security_duration_s
+
+          exit $STATUS
+
+      - name: Render validate-security summary
+        if: ${{ always() && github.event.inputs.validation == 'validate-security' }}
+        run: |
+          OUTCOME="${{ steps.validate_security.outcome }}"
+          DURATION_S="n/a"
+          if [ -f /tmp/validate_security_duration_s ]; then
+            DURATION_S="$(cat /tmp/validate_security_duration_s)s"
+          fi
+
+          echo "### Validate Security Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Outcome | \`$OUTCOME\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Duration | \`$DURATION_S\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Pipeline | \`validate:security:retry\` |" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$OUTCOME" != "success" ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Failure hints:" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Start local runtime: \`pnpm dev:all\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Re-run security validation locally: \`pnpm validate:security:retry\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Isolate HTTP security headers: \`pnpm smoke:http:security\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Isolate auth token-family reuse checks: \`pnpm smoke:auth:reuse-only\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Isolate WS negative checks: \`pnpm smoke:ws:negative\`" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Render validate-security JSON summary
+        if: ${{ always() && github.event.inputs.validation == 'validate-security' }}
+        run: |
+          SUMMARY_FILE="artifacts/security/validate-security-summary.json"
+          OUTCOME="${{ steps.validate_security.outcome }}"
+          DURATION_S="n/a"
+          if [ -f /tmp/validate_security_duration_s ]; then
+            DURATION_S="$(cat /tmp/validate_security_duration_s)s"
+          fi
+          echo "### Validate Security Step Details" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f "$SUMMARY_FILE" ]; then
+            node scripts/render-validate-security-summary.mjs "$SUMMARY_FILE" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+            echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Summary file | \`missing\` |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Expected path | \`$SUMMARY_FILE\` |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Validate-security step outcome | \`$OUTCOME\` |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Validate-security step duration | \`$DURATION_S\` |" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Troubleshooting:" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Ensure \`scripts/validate-security.mjs\` completed its summary write path." >> "$GITHUB_STEP_SUMMARY"
+            echo "- Re-run locally: \`pnpm validate:security\` and confirm \`artifacts/security/validate-security-summary.json\` exists." >> "$GITHUB_STEP_SUMMARY"
+            echo "- Check runtime logs artifact for early process termination before summary write." >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Render validate-fast summary
         if: ${{ always() && github.event.inputs.validation == 'validate-fast' }}
@@ -630,7 +877,7 @@ jobs:
           echo "| Smoke duration | \`$SMOKE_DURATION_S\` |" >> "$GITHUB_STEP_SUMMARY"
           echo "| E2E duration | \`$E2E_DURATION_S\` |" >> "$GITHUB_STEP_SUMMARY"
           echo "| k6 duration | \`$K6_DURATION_S\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Pipeline | \`smoke:all -> e2e -> load:k6:signaling:quick:summary\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Pipeline | \`smoke:http -> smoke:auth -> smoke:ws -> smoke:ws:limits -> smoke:ws:negative -> e2e -> load:k6:signaling:quick:summary\` |" >> "$GITHUB_STEP_SUMMARY"
           if [ "$OVERALL_OUTCOME" != "success" ]; then
             echo "" >> "$GITHUB_STEP_SUMMARY"
             echo "Failure hints:" >> "$GITHUB_STEP_SUMMARY"
@@ -698,7 +945,7 @@ jobs:
           echo "- Inspect uploaded artifacts: Playwright report, runtime logs, and \`artifacts/k6/*.json\`" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload Playwright artifacts
-        if: ${{ always() && github.event.inputs.validation != 'smoke-only' && github.event.inputs.validation != 'ws-strict-only' && github.event.inputs.validation != 'release-readiness' && github.event.inputs.validation != 'release-readiness-live' && github.event.inputs.validation != 'pre-release-full' && github.event.inputs.validation != 'pre-release-live' }}
+        if: ${{ always() && github.event.inputs.validation != 'smoke-http-security' && github.event.inputs.validation != 'auth-smoke-only' && github.event.inputs.validation != 'auth-audit-only' && github.event.inputs.validation != 'smoke-only' && github.event.inputs.validation != 'ws-strict-only' && github.event.inputs.validation != 'validate-security' && github.event.inputs.validation != 'release-readiness' && github.event.inputs.validation != 'release-readiness-live' && github.event.inputs.validation != 'pre-release-full' && github.event.inputs.validation != 'pre-release-live' }}
         uses: actions/upload-artifact@v4
         with:
           name: playwright-artifacts-${{ github.run_id }}
@@ -713,6 +960,14 @@ jobs:
         with:
           name: k6-artifacts-${{ github.run_id }}
           path: artifacts/k6/*.json
+          if-no-files-found: warn
+
+      - name: Upload security artifacts
+        if: ${{ always() && (github.event.inputs.validation == 'validate-security' || github.event.inputs.validation == 'auth-smoke-only' || github.event.inputs.validation == 'auth-audit-only' || github.event.inputs.validation == 'smoke-http-security') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-artifacts-${{ github.run_id }}
+          path: artifacts/security/*.json
           if-no-files-found: warn
 
       - name: Upload runtime logs

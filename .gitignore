@@ -11,3 +11,4 @@ playwright-report
 test-results
 artifacts/k6/*.json
 artifacts/k6/baseline-tmp/
+artifacts/security/*.json

@@ -83,7 +83,11 @@ export class AuthService {
 
     const nextRefreshTokenId = uuidv4();
     const nextAccessToken = await this.signAccessToken(userId);
-    const nextRefreshToken = await this.signRefreshToken(userId, payload.familyId, nextRefreshTokenId);
+    const nextRefreshToken = await this.signRefreshToken(
+      userId,
+      payload.familyId,
+      nextRefreshTokenId
+    );
 
     await this.storeRefreshToken(nextRefreshTokenId, payload.familyId, userId);
 
@@ -93,6 +97,11 @@ export class AuthService {
       expiresIn: ACCESS_TTL_SECONDS,
       refreshExpiresIn: REFRESH_TTL_SECONDS
     };
+  }
+
+  public async revoke(refreshToken: string): Promise<void> {
+    const payload = await this.verifyRefreshToken(refreshToken);
+    await this.revokeFamily(payload.familyId);
   }
 
   private async signAccessToken(userId: string): Promise<string> {
@@ -158,7 +167,11 @@ export class AuthService {
     return (await this.redis.get(this.familyRevokedKey(familyId))) === '1';
   }
 
-  private async storeRefreshToken(tokenId: string, familyId: string, userId: string): Promise<void> {
+  private async storeRefreshToken(
+    tokenId: string,
+    familyId: string,
+    userId: string
+  ): Promise<void> {
     const key = this.refreshTokenKey(tokenId);
     await this.redis.hset(key, {
       familyId,

@@ -140,11 +140,40 @@ describe('AuthService', () => {
     });
   });
 
+  it('revokes token family when an intermediate refresh token is reused', async () => {
+    const redis = new FakeRedis();
+    const service = new AuthService(redis as never);
+
+    const initial = await service.issueSession('user-3');
+    const rotated1 = await service.rotate(initial.refreshToken);
+    const rotated2 = await service.rotate(rotated1.refreshToken);
+
+    await expect(service.rotate(rotated1.refreshToken)).rejects.toMatchObject({
+      code: 'TOKEN_REUSE_DETECTED'
+    });
+
+    await expect(service.rotate(rotated2.refreshToken)).rejects.toMatchObject({
+      code: 'UNAUTHORIZED'
+    });
+  });
+
   it('rejects invalid refresh token', async () => {
     const redis = new FakeRedis();
     const service = new AuthService(redis as never);
 
     await expect(service.rotate('not-a-jwt')).rejects.toMatchObject({
+      code: 'UNAUTHORIZED'
+    });
+  });
+
+  it('revokes refresh token family on logout and blocks further rotation', async () => {
+    const redis = new FakeRedis();
+    const service = new AuthService(redis as never);
+
+    const initial = await service.issueSession('user-logout');
+    await service.revoke(initial.refreshToken);
+
+    await expect(service.rotate(initial.refreshToken)).rejects.toMatchObject({
       code: 'UNAUTHORIZED'
     });
   });

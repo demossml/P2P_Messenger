@@ -107,6 +107,13 @@ type PeerConnectionQualityEntry = {
   jitterMs: number | null;
 };
 
+type E2EConnectionDebugEntry = {
+  peerId: string;
+  connectionState: RTCPeerConnectionState;
+  iceConnectionState: RTCIceConnectionState;
+  chatChannelState: RTCDataChannelState | null;
+};
+
 type PreferredDevices = {
   audioInputId: string;
   videoInputId: string;
@@ -152,6 +159,20 @@ const RELAY_TOGGLE_COOLDOWN_MS = 15_000;
 const CHAT_SEND_RETRY_ATTEMPTS = 20;
 const CHAT_SEND_RETRY_DELAY_MS = 250;
 
+function localRtcConfigurationOverride(): RTCConfiguration | undefined {
+  const host = window.location.hostname;
+  if (host === 'localhost' || host === '127.0.0.1') {
+    return {
+      iceServers: [],
+      iceCandidatePoolSize: 4,
+      bundlePolicy: 'max-bundle',
+      rtcpMuxPolicy: 'require'
+    };
+  }
+
+  return undefined;
+}
+
 function getOrCreateStorageValue(key: string, fallbackFactory: () => string): string {
   const existingValue = sessionStorage.getItem(key);
   if (existingValue) {
@@ -175,10 +196,41 @@ function defaultApiBaseUrl(): string {
   return `${protocol}//${host}:3001`;
 }
 
+function clearStoredAuthTokens(): void {
+  sessionStorage.removeItem(ACCESS_TOKEN_KEY);
+  sessionStorage.removeItem(REFRESH_TOKEN_KEY);
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
     window.setTimeout(resolve, ms);
   });
+}
+
+function getE2EChunkSendDelayMs(): number {
+  const maybeDelay = (
+    window as typeof window & {
+      __e2eChunkSendDelayMs?: unknown;
+    }
+  ).__e2eChunkSendDelayMs;
+  if (typeof maybeDelay !== 'number' || !Number.isFinite(maybeDelay)) {
+    return 0;
+  }
+
+  return Math.max(0, Math.floor(maybeDelay));
+}
+
+function shouldDropE2EOutgoingFileChunk(): boolean {
+  const bridge = window as typeof window & {
+    __e2eDropOutgoingFileChunksRemaining?: unknown;
+  };
+  const remaining = bridge.__e2eDropOutgoingFileChunksRemaining;
+  if (typeof remaining !== 'number' || !Number.isFinite(remaining) || remaining <= 0) {
+    return false;
+  }
+
+  bridge.__e2eDropOutgoingFileChunksRemaining = Math.max(0, Math.floor(remaining - 1));
+  return true;
 }
 
 function parseJwtPayload(token: string): { exp?: number } | null {
@@ -325,6 +377,7 @@ export function useSignaling(): {
   const outgoingTransferPeerStateRef = useRef<Map<string, Map<string, OutgoingPeerAckState>>>(
     new Map()
   );
+  const pendingChatByPeerRef = useRef<Map<string, ChatMessage[]>>(new Map());
   const signingPrivateKeyRef = useRef<CryptoKey | null>(null);
   const ecdhPrivateKeyRef = useRef<CryptoKey | null>(null);
   const remotePeerPublicKeySpkiRef = useRef<Map<string, string>>(new Map());
@@ -339,6 +392,8 @@ export function useSignaling(): {
   const relayDisableStreakRef = useRef<number>(0);
   const relayToggleInFlightRef = useRef<boolean>(false);
   const lastRelayToggleAtRef = useRef<number>(0);
+  const latestOutgoingFileIdRef = useRef<string | null>(null);
+  const fileAckMissingChunksHistoryRef = useRef<Map<string, number[]>>(new Map());
 
   function setPreferredDevices(next: Partial<PreferredDevices>): void {
     setPreferredDevicesState((current) => {
@@ -637,7 +692,10 @@ export function useSignaling(): {
   async function sendChatMessageWithRetry(
     peerId: string,
     message: ChatMessage,
-    attempts = CHAT_SEND_RETRY_ATTEMPTS
+    attempts = CHAT_SEND_RETRY_ATTEMPTS,
+    options?: {
+      enqueueOnFailure?: boolean;
+    }
   ): Promise<boolean> {
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
       const manager = peerManagerRef.current;
@@ -655,7 +713,48 @@ export function useSignaling(): {
       }
     }
 
+    if (options?.enqueueOnFailure !== false) {
+      const queue = pendingChatByPeerRef.current.get(peerId) ?? [];
+      const maxQueuedMessagesPerPeer = 200;
+      if (queue.length >= maxQueuedMessagesPerPeer) {
+        queue.shift();
+      }
+      queue.push(message);
+      pendingChatByPeerRef.current.set(peerId, queue);
+      return true;
+    }
+
     return false;
+  }
+
+  async function flushPendingChatForPeer(peerId: string): Promise<void> {
+    const manager = peerManagerRef.current;
+    if (!manager || !manager.hasOpenChatChannel(peerId)) {
+      return;
+    }
+
+    const queue = pendingChatByPeerRef.current.get(peerId);
+    if (!queue || queue.length === 0) {
+      return;
+    }
+
+    while (queue.length > 0) {
+      const next = queue[0];
+      if (!next) {
+        break;
+      }
+
+      const sent = await manager.sendChatMessage(peerId, next);
+      if (!sent) {
+        return;
+      }
+
+      queue.shift();
+    }
+
+    if (queue.length === 0) {
+      pendingChatByPeerRef.current.delete(peerId);
+    }
   }
 
   async function sendFileMetaToPeer(
@@ -675,7 +774,9 @@ export function useSignaling(): {
       totalChunks: transfer.totalChunks,
       checksum: transfer.checksum
     });
-    const sent = await sendChatMessageWithRetry(peerId, message);
+    const sent = await sendChatMessageWithRetry(peerId, message, CHAT_SEND_RETRY_ATTEMPTS, {
+      enqueueOnFailure: false
+    });
     if (!sent) {
       return false;
     }
@@ -697,6 +798,14 @@ export function useSignaling(): {
 
     const safeChunkIndexes = normalizeChunkIndexes(chunkIndexes, transfer.totalChunks);
     for (const chunkIndex of safeChunkIndexes) {
+      const chunkDelayMs = getE2EChunkSendDelayMs();
+      if (chunkDelayMs > 0) {
+        await sleep(chunkDelayMs);
+      }
+      if (shouldDropE2EOutgoingFileChunk()) {
+        continue;
+      }
+
       const start = chunkIndex * DEFAULT_FILE_CHUNK_SIZE_BYTES;
       const end = Math.min(start + DEFAULT_FILE_CHUNK_SIZE_BYTES, transfer.size);
       const chunkBuffer = transfer.fileBuffer.slice(start, end);
@@ -708,7 +817,9 @@ export function useSignaling(): {
         chunkIndex,
         data: chunkData
       });
-      const sent = await sendChatMessageWithRetry(peerId, message);
+      const sent = await sendChatMessageWithRetry(peerId, message, CHAT_SEND_RETRY_ATTEMPTS, {
+        enqueueOnFailure: false
+      });
       if (!sent) {
         return;
       }
@@ -861,22 +972,26 @@ export function useSignaling(): {
         }
 
         const refreshToken = sessionStorage.getItem(REFRESH_TOKEN_KEY);
-        if (refreshToken && !isTokenExpired(refreshToken)) {
-          const refreshResult = await fetch(
-            `${apiBaseUrl}/auth/refresh?token=${encodeURIComponent(refreshToken)}`
-          );
-          if (refreshResult.ok) {
-            const refreshed = (await refreshResult.json()) as {
-              accessToken: string;
-              refreshToken: string;
-            };
-            sessionStorage.setItem(ACCESS_TOKEN_KEY, refreshed.accessToken);
-            sessionStorage.setItem(REFRESH_TOKEN_KEY, refreshed.refreshToken);
-            return refreshed.accessToken;
-          }
+        const canUseRefreshToken = refreshToken && !isTokenExpired(refreshToken);
+        const refreshUrl = canUseRefreshToken
+          ? `${apiBaseUrl}/auth/refresh?token=${encodeURIComponent(refreshToken)}`
+          : `${apiBaseUrl}/auth/refresh`;
+        const refreshResult = await fetch(refreshUrl, {
+          credentials: 'include'
+        });
+        if (refreshResult.ok) {
+          const refreshed = (await refreshResult.json()) as {
+            accessToken: string;
+            refreshToken: string;
+          };
+          sessionStorage.setItem(ACCESS_TOKEN_KEY, refreshed.accessToken);
+          sessionStorage.setItem(REFRESH_TOKEN_KEY, refreshed.refreshToken);
+          return refreshed.accessToken;
         }
 
-        const loginResult = await fetch(`${apiBaseUrl}/auth/dev-login?userId=demo-user`);
+        const loginResult = await fetch(`${apiBaseUrl}/auth/dev-login?userId=demo-user`, {
+          credentials: 'include'
+        });
         if (!loginResult.ok) {
           throw new Error('Failed to fetch auth token from /auth/dev-login.');
         }
@@ -921,7 +1036,7 @@ export function useSignaling(): {
         setLastError(error.message);
       }
     });
-  }, [identity.peerId, peerPublicKey]);
+  }, [identity.peerId]);
 
   useEffect(() => {
     const intervalId = window.setInterval(() => {
@@ -1005,12 +1120,15 @@ export function useSignaling(): {
   }, [connectionStats.quality, connectionStats.relayFallbackRecommended, relayModeEnabled]);
 
   useEffect(() => {
+    const rtcConfigurationOverride = localRtcConfigurationOverride();
     const manager = new PeerManager({
       localPeerId: identity.peerId,
       transport,
+      ...(rtcConfigurationOverride ? { rtcConfiguration: rtcConfigurationOverride } : {}),
       onPeerConnected: (peerId) => {
         remotePeerIdsRef.current.add(peerId);
         setRemotePeerCount(remotePeerIdsRef.current.size);
+        void flushPendingChatForPeer(peerId);
       },
       onPeerDisconnected: (peerId) => {
         remotePeerIdsRef.current.delete(peerId);
@@ -1289,6 +1407,10 @@ export function useSignaling(): {
             if (payload.status === 'accepted') {
               peerAckState.acknowledged = true;
               peerAckState.retryCount = 0;
+              const missingHistory =
+                fileAckMissingChunksHistoryRef.current.get(payload.fileId) ?? [];
+              missingHistory.push(payload.missingChunks?.length ?? 0);
+              fileAckMissingChunksHistoryRef.current.set(payload.fileId, missingHistory);
               const transfer = outgoingTransfersRef.current.get(payload.fileId);
               if (transfer) {
                 const requestedChunks =
@@ -1324,7 +1446,59 @@ export function useSignaling(): {
     });
 
     peerManagerRef.current = manager;
+    (
+      window as typeof window & {
+        __e2eGetConnectionDebug?: () => E2EConnectionDebugEntry[];
+        __e2eGetLatestOutgoingFileId?: () => string | null;
+        __e2eGetFileAckMissingChunksHistory?: (fileId: string) => number[];
+      }
+    ).__e2eGetConnectionDebug = () => {
+      const currentManager = peerManagerRef.current;
+      if (!currentManager) {
+        return [];
+      }
+
+      return currentManager
+        .getConnections()
+        .map(({ peerId, connection }) => ({
+          peerId,
+          connectionState: connection.connectionState,
+          iceConnectionState: connection.iceConnectionState,
+          chatChannelState: currentManager.getChatChannelState(peerId)
+        }))
+        .sort((left, right) => left.peerId.localeCompare(right.peerId));
+    };
+    (
+      window as typeof window & {
+        __e2eGetLatestOutgoingFileId?: () => string | null;
+      }
+    ).__e2eGetLatestOutgoingFileId = () => latestOutgoingFileIdRef.current;
+    (
+      window as typeof window & {
+        __e2eGetFileAckMissingChunksHistory?: (fileId: string) => number[];
+      }
+    ).__e2eGetFileAckMissingChunksHistory = (fileId: string) => [
+      ...(fileAckMissingChunksHistoryRef.current.get(fileId) ?? [])
+    ];
+
     return () => {
+      delete (
+        window as typeof window & {
+          __e2eGetConnectionDebug?: () => E2EConnectionDebugEntry[];
+          __e2eGetLatestOutgoingFileId?: () => string | null;
+          __e2eGetFileAckMissingChunksHistory?: (fileId: string) => number[];
+        }
+      ).__e2eGetConnectionDebug;
+      delete (
+        window as typeof window & {
+          __e2eGetLatestOutgoingFileId?: () => string | null;
+        }
+      ).__e2eGetLatestOutgoingFileId;
+      delete (
+        window as typeof window & {
+          __e2eGetFileAckMissingChunksHistory?: (fileId: string) => number[];
+        }
+      ).__e2eGetFileAckMissingChunksHistory;
       manager.closeAll();
       peerManagerRef.current = null;
     };
@@ -1336,7 +1510,6 @@ export function useSignaling(): {
     if (restored) {
       setRoomIdState(restored);
     }
-    transport.reconnectFromSession();
 
     return () => {
       if (localStreamRef.current) {
@@ -1353,6 +1526,41 @@ export function useSignaling(): {
       transportRef.current = null;
     };
   }, [transport]);
+
+  useEffect(() => {
+    if (!peerPublicKey) {
+      return;
+    }
+
+    const transportWithMutableKey = transport as SignalingTransport & {
+      setPeerPublicKey?: (nextPeerPublicKey: string) => void;
+    };
+    transportWithMutableKey.setPeerPublicKey?.(peerPublicKey);
+  }, [peerPublicKey, transport]);
+
+  useEffect(() => {
+    if (!isSigningReady || !peerPublicKey) {
+      return;
+    }
+
+    const transportWithMutableKey = transport as SignalingTransport & {
+      setPeerPublicKey?: (nextPeerPublicKey: string) => void;
+    };
+    transportWithMutableKey.setPeerPublicKey?.(peerPublicKey);
+    transport.reconnectFromSession();
+  }, [isSigningReady, peerPublicKey, transport]);
+
+  useEffect(() => {
+    const intervalId = window.setInterval(() => {
+      for (const peerId of remotePeerIdsRef.current) {
+        void flushPendingChatForPeer(peerId);
+      }
+    }, 400);
+
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, []);
 
   useEffect(() => {
     const intervalId = window.setInterval(() => {
@@ -1603,6 +1811,12 @@ export function useSignaling(): {
           setLastError(null);
           setRoomIdState(normalizedRoomId);
           writeRoomIdToSessionStorage(normalizedRoomId);
+          const currentTransport = transportRef.current as
+            | (SignalingTransport & {
+                setPeerPublicKey?: (nextPeerPublicKey: string) => void;
+              })
+            | null;
+          currentTransport?.setPeerPublicKey?.(peerPublicKey);
           transportRef.current?.connect(normalizedRoomId);
         } catch (error) {
           setLastError(error instanceof Error ? error.message : 'Failed to start local media.');
@@ -1610,40 +1824,59 @@ export function useSignaling(): {
       })();
     },
     disconnect: () => {
-      peerManagerRef.current?.closeAll();
-      remotePeerIdsRef.current.clear();
-      remoteStreamsMapRef.current.clear();
-      remotePeerPublicKeySpkiRef.current.clear();
-      remotePeerVerifyKeyRef.current.clear();
-      remotePeerFingerprintRef.current.clear();
-      syncRemoteFingerprintsState();
-      incomingFileMetaRef.current.clear();
-      incomingFileChunksRef.current.clear();
-      outgoingTransfersRef.current.clear();
-      outgoingTransferPeerStateRef.current.clear();
-      bitrateByPeerRef.current.clear();
-      statsTrackingStartedAtRef.current = null;
-      lastQualityRef.current = 'good';
-      relayEnableStreakRef.current = 0;
-      relayDisableStreakRef.current = 0;
-      relayToggleInFlightRef.current = false;
-      lastRelayToggleAtRef.current = 0;
-      setRelayModeEnabled(false);
-      setNetworkNotice(null);
-      setPeerConnectionQualities([]);
-      setConnectionStats({
-        quality: 'good',
-        packetLossPercent: 0,
-        rttMs: null,
-        jitterMs: null,
-        relayFallbackRecommended: false
-      });
-      setRemoteStreamsState([]);
-      setRemotePeerCount(0);
-      setFileTransfers([]);
-      setRoomIdState('');
-      writeRoomIdToSessionStorage('');
-      transportRef.current?.disconnect();
+      void (async () => {
+        const apiBaseUrl = defaultApiBaseUrl();
+        const refreshToken = sessionStorage.getItem(REFRESH_TOKEN_KEY);
+        const logoutUrl = refreshToken
+          ? `${apiBaseUrl}/auth/logout?token=${encodeURIComponent(refreshToken)}`
+          : `${apiBaseUrl}/auth/logout`;
+        try {
+          await fetch(logoutUrl, {
+            method: 'GET',
+            credentials: 'include',
+            keepalive: true
+          });
+        } catch {
+          // Ignore logout endpoint failure on disconnect and continue local cleanup.
+        }
+
+        clearStoredAuthTokens();
+
+        peerManagerRef.current?.closeAll();
+        remotePeerIdsRef.current.clear();
+        remoteStreamsMapRef.current.clear();
+        remotePeerPublicKeySpkiRef.current.clear();
+        remotePeerVerifyKeyRef.current.clear();
+        remotePeerFingerprintRef.current.clear();
+        syncRemoteFingerprintsState();
+        incomingFileMetaRef.current.clear();
+        incomingFileChunksRef.current.clear();
+        outgoingTransfersRef.current.clear();
+        outgoingTransferPeerStateRef.current.clear();
+        bitrateByPeerRef.current.clear();
+        statsTrackingStartedAtRef.current = null;
+        lastQualityRef.current = 'good';
+        relayEnableStreakRef.current = 0;
+        relayDisableStreakRef.current = 0;
+        relayToggleInFlightRef.current = false;
+        lastRelayToggleAtRef.current = 0;
+        setRelayModeEnabled(false);
+        setNetworkNotice(null);
+        setPeerConnectionQualities([]);
+        setConnectionStats({
+          quality: 'good',
+          packetLossPercent: 0,
+          rttMs: null,
+          jitterMs: null,
+          relayFallbackRecommended: false
+        });
+        setRemoteStreamsState([]);
+        setRemotePeerCount(0);
+        setFileTransfers([]);
+        setRoomIdState('');
+        writeRoomIdToSessionStorage('');
+        transportRef.current?.disconnect();
+      })();
     },
     toggleMute: () => {
       const stream = localStreamRef.current;
@@ -1898,6 +2131,7 @@ export function useSignaling(): {
         const fileBuffer = await file.arrayBuffer();
         const checksum = `sha256:${await sha256Hex(fileBuffer)}`;
         const fileId = crypto.randomUUID();
+        latestOutgoingFileIdRef.current = fileId;
         const totalChunks = computeTotalChunks(file.size, DEFAULT_FILE_CHUNK_SIZE_BYTES);
 
         const transfer: FileTransferEntry = {

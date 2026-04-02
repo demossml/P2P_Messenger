@@ -39,6 +39,7 @@ export class SignalingTransport {
   private readonly onStatus: (status: ConnectionStatus) => void;
   private readonly onMessage: (message: SignalingOutboundMessage) => void;
   private readonly onError: (error: Error) => void;
+  private peerPublicKey: string;
 
   private socket: WebSocket | null = null;
   private reconnectTimeoutId: number | null = null;
@@ -51,6 +52,7 @@ export class SignalingTransport {
     this.onStatus = options.onStatus ?? (() => undefined);
     this.onMessage = options.onMessage ?? (() => undefined);
     this.onError = options.onError ?? (() => undefined);
+    this.peerPublicKey = options.peerPublicKey;
   }
 
   public connect(roomId: string): void {
@@ -108,6 +110,10 @@ export class SignalingTransport {
       this.socket.close();
       this.socket = null;
     }
+  }
+
+  public setPeerPublicKey(peerPublicKey: string): void {
+    this.peerPublicKey = peerPublicKey;
   }
 
   private openSocket(status: ConnectionStatus): void {
@@ -173,7 +179,7 @@ export class SignalingTransport {
         roomId: this.activeRoomId,
         peerId: this.options.peerId,
         token,
-        peerPublicKey: this.options.peerPublicKey
+        peerPublicKey: this.peerPublicKey
       };
 
       this.sendJson(joinMessage);

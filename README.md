@@ -44,18 +44,21 @@ Manual split mode (if needed):
 
 Use this quick guide to pick the right validation scope:
 
-| Goal                                                 | Fastest command            | Notes                                                                        |
-| ---------------------------------------------------- | -------------------------- | ---------------------------------------------------------------------------- |
-| Quick API + signaling sanity check                   | `pnpm smoke:minimal`       | Runs HTTP + WS happy-path only.                                              |
-| Quick API + signaling sanity with startup resilience | `pnpm smoke:minimal:retry` | Retries on transient startup/network hiccups.                                |
-| Full signaling smoke coverage                        | `pnpm smoke:all`           | Includes negative-path checks (`INVALID_JSON`, rate-limit, room full, etc.). |
-| Strict WS-only validation                            | `pnpm smoke:ws:strict`     | Runs WS schema limits + WS negative checks (without HTTP smoke).             |
-| Quick browser E2E sanity                             | `pnpm e2e:minimal`         | Minimal Playwright flow: `join -> text -> read receipt`.                     |
-| Quick browser E2E with resilience                    | `pnpm e2e:minimal:retry`   | Retries minimal Playwright flow.                                             |
-| Full browser E2E                                     | `pnpm e2e`                 | Runs all Playwright scenarios.                                               |
-| Full browser E2E with resilience                     | `pnpm e2e:retry`           | Retries full Playwright suite.                                               |
-| One-command fast validation                          | `pnpm validate:fast`       | Runs `smoke:minimal:retry` then `e2e:minimal:retry`.                         |
-| One-command full validation                          | `pnpm validate:full`       | Runs `smoke:all`, `e2e:retry`, `lint`, `typecheck`.                          |
+| Goal                                                 | Fastest command                | Notes                                                                |
+| ---------------------------------------------------- | ------------------------------ | -------------------------------------------------------------------- |
+| Quick API + signaling sanity check                   | `pnpm smoke:minimal`           | Runs HTTP + WS happy-path only.                                      |
+| Quick API + signaling sanity with startup resilience | `pnpm smoke:minimal:retry`     | Retries on transient startup/network hiccups.                        |
+| HTTP security headers only                           | `pnpm smoke:http:security`     | Verifies security headers on auth/turn HTTP endpoints.               |
+| Full signaling smoke coverage                        | `pnpm smoke:all`               | Includes HTTP auth-cookie checks + WS negative-path checks.          |
+| Strict WS-only validation                            | `pnpm smoke:ws:strict`         | Runs WS schema limits + WS negative checks (without HTTP smoke).     |
+| Quick browser E2E sanity                             | `pnpm e2e:minimal`             | Minimal Playwright flow: `join -> text -> read receipt`.             |
+| Quick browser E2E with resilience                    | `pnpm e2e:minimal:retry`       | Retries minimal Playwright flow.                                     |
+| Reconnect-focused browser E2E                        | `pnpm e2e:reconnect`           | Runs only reconnect/resume Playwright scenarios (`@reconnect`).      |
+| Full browser E2E                                     | `pnpm e2e`                     | Runs all Playwright scenarios.                                       |
+| Full browser E2E with resilience                     | `pnpm e2e:retry`               | Retries full Playwright suite.                                       |
+| One-command fast validation                          | `pnpm validate:fast`           | Runs `smoke:minimal:retry` then `e2e:minimal:retry`.                 |
+| One-command security validation                      | `pnpm validate:security:retry` | Runs security pipeline with retry wrapper for cold-start resilience. |
+| One-command full validation                          | `pnpm validate:full`           | Runs `smoke:all`, `e2e:retry`, `lint`, `typecheck`.                  |
 
 ## Recommended sequences
 
@@ -107,6 +110,20 @@ For a formal go/no-go flow, use [RELEASE_CHECKLIST.md](/Users/dmitrijsuvalov/Doc
 You can still run checks separately if needed:
 
 - `pnpm smoke:http`
+  - includes HTTP security-header assertions for auth/turn routes (`X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, `Permissions-Policy`, `CSP`)
+- `pnpm smoke:http:security` (same HTTP security-header assertions, useful as an explicit CI/manual target)
+  - writes JSON summary to `artifacts/security/smoke-http-security-summary.json`
+  - summary path can be overridden via `P2P_SMOKE_HTTP_SECURITY_SUMMARY_PATH`
+- `pnpm smoke:auth` (aggregated auth smoke: `smoke:auth:lifecycle-only` + `smoke:auth:reuse-only`)
+  - runner writes JSON summary to `artifacts/security/auth-smoke-summary.json`
+  - summary path can be overridden via `P2P_AUTH_SMOKE_SUMMARY_PATH`
+- `pnpm smoke:auth:retry` (retry wrapper for aggregated auth smoke)
+- `pnpm smoke:auth:lifecycle-only` (auth cookie lifecycle: dev-login -> refresh(cookie) -> logout(cookie) -> refresh denied with `UNAUTHORIZED`)
+- `pnpm smoke:auth:reuse-only` (focused refresh-token-family abuse check: old refresh reuse -> `TOKEN_REUSE_DETECTED`, then family blocked -> `UNAUTHORIZED`)
+- `pnpm smoke:auth:audit-only` (auth audit endpoint checks: `/auth/audit` requires bearer token, rejects invalid token, returns own login audit event on success)
+- `pnpm smoke:auth:audit-only:retry` (retry wrapper for auth audit smoke)
+  - writes JSON summary to `artifacts/security/auth-audit-smoke-summary.json`
+  - summary path can be overridden via `P2P_AUTH_AUDIT_SMOKE_SUMMARY_PATH`
 - `pnpm smoke:ws`
 - `pnpm smoke:ws:limits` (fast schema-limit checks for oversized `join.peerPublicKey`, `offer.sdp`, `ice-candidate.candidate`)
 - `pnpm smoke:ws:strict` (runs `smoke:ws:limits` + `smoke:ws:negative`)
@@ -161,12 +178,17 @@ CI load workflow:
 Manual pre-release validation:
 
 - `.github/workflows/ci.yml` also supports `workflow_dispatch` with:
+  - `smoke-http-security`
+  - `auth-smoke-only`
+  - `auth-audit-only`
   - `smoke-only`
   - `ws-strict-only`
   - `smoke-minimal`
   - `e2e-minimal`
+  - `e2e-reconnect-only`
   - `e2e-only`
   - `e2e-full-retry`
+  - `validate-security`
   - `validate-fast`
   - `validate-full`
   - `release-readiness`
@@ -176,6 +198,12 @@ Manual pre-release validation:
   - `smoke-and-e2e`
   - `smoke-e2e-k6`
 - Starts local signaling + client runtime in CI, runs selected suites, and uploads logs/test artifacts.
+- `smoke-http-security` runs only `smoke:http:security` and writes `Smoke HTTP Security Summary` (`outcome`, `duration`, `pipeline`) to GitHub Step Summary.
+  - also renders per-step details from `artifacts/security/smoke-http-security-summary.json` (via `scripts/render-smoke-http-summary.mjs`) and uploads it as CI artifact.
+- `auth-smoke-only` runs `smoke:auth:retry` (`smoke:auth:lifecycle-only` + `smoke:auth:reuse-only` under retry wrapper) and writes `Auth Smoke Summary` (`outcome`, `duration`, `pipeline`) to GitHub Step Summary.
+  - also renders per-step details from `artifacts/security/auth-smoke-summary.json` (via `scripts/render-auth-smoke-summary.mjs`) and uploads it as CI artifact.
+- `auth-audit-only` runs `smoke:auth:audit-only:retry` (protected `/auth/audit` checks with retry wrapper) and writes `Auth Audit Summary` (`outcome`, `duration`, `pipeline`) to GitHub Step Summary.
+  - also renders per-step details from `artifacts/security/auth-audit-smoke-summary.json` (via `scripts/render-auth-audit-summary.mjs`) and uploads it as CI artifact.
 - `smoke-minimal` runs only `smoke:http` + `smoke:ws` (without negative-path suite).
 - `ws-strict-only` runs strict WS checks only (`smoke:ws:strict` = `smoke:ws:limits` + `smoke:ws:negative`), without HTTP smoke and without Playwright.
 - `ws-strict-only` writes a compact `WS Strict Summary` table (`outcome`, `duration`, `pipeline`) to GitHub Step Summary.
@@ -183,6 +211,8 @@ Manual pre-release validation:
 - `smoke-only` writes a compact `Smoke Full Summary` table (`outcome`, `duration`, `pipeline`) to GitHub Step Summary.
 - `smoke-and-e2e` writes a compact `Smoke And E2E Summary` table (overall/smoke/e2e outcomes + durations + pipeline) to GitHub Step Summary.
 - `e2e-minimal`, `e2e-only`, and `e2e-full-retry` write a compact `E2E Summary` table (`outcome`, `duration`, `pipeline`) to GitHub Step Summary.
+- `validate-security` writes a compact `Validate Security Summary` table (`outcome`, `duration`, `pipeline`) to GitHub Step Summary.
+  - also renders per-step details from `artifacts/security/validate-security-summary.json` (via `scripts/render-validate-security-summary.mjs`) and uploads it as CI artifact.
 - `smoke-e2e-k6` writes a top-level `Smoke E2E K6 Summary` table (overall/smoke/e2e/k6 outcomes + durations + pipeline) to GitHub Step Summary.
 - `release-readiness` and `release-readiness-live` write a compact `Release Readiness Summary` table (`outcome`, `duration`, `pipeline`) to GitHub Step Summary.
 - `pre-release-full` runs `release:readiness -> validate:full` and writes a top-level `Pre Release Full Summary` table (overall/readiness/validate outcomes + durations + pipeline) to GitHub Step Summary.
@@ -191,7 +221,15 @@ Manual pre-release validation:
 - Retry knobs:
   - `P2P_SMOKE_RETRY_ATTEMPTS` (default `3`)
   - `P2P_SMOKE_RETRY_DELAY_MS` (default `1500`)
+- `auth-smoke-only` in CI uses `smoke:auth:retry` (`2` attempts, `1500ms` delay by default).
+- Auth smoke retry knobs:
+  - `P2P_AUTH_SMOKE_RETRY_ATTEMPTS` (default `2`)
+  - `P2P_AUTH_SMOKE_RETRY_DELAY_MS` (default `1500`)
+- Auth audit smoke retry knobs:
+  - `P2P_AUTH_AUDIT_SMOKE_RETRY_ATTEMPTS` (default `2`)
+  - `P2P_AUTH_AUDIT_SMOKE_RETRY_DELAY_MS` (default `1500`)
 - `e2e-minimal` runs only the fast Playwright `@minimal` flow (`join -> text -> read receipt`).
+- `e2e-reconnect-only` runs only reconnect/resume Playwright flow (`@reconnect` via `pnpm e2e:reconnect`).
 - `e2e-minimal` in CI uses `e2e:minimal:retry` (`2` attempts, `2000ms` delay by default).
 - E2E retry knobs:
   - `P2P_E2E_RETRY_ATTEMPTS` (default `2`)
@@ -201,6 +239,13 @@ Manual pre-release validation:
   - `P2P_E2E_FULL_RETRY_ATTEMPTS` (default `2`)
   - `P2P_E2E_FULL_RETRY_DELAY_MS` (default `3000`)
 - `validate-fast` runs the aggregated pipeline `validate:fast` (`smoke:minimal:retry` -> `e2e:minimal:retry`).
+- `validate-security` runs the aggregated pipeline `validate:security:retry` (`validate:security` with retries).
+  - underlying `validate:security` runner executes: `smoke:http:security -> smoke:auth:reuse-only -> smoke:auth:audit-only -> smoke:ws:negative` with step-specific local failure hints.
+  - local runner also prints a compact per-step summary with pass/fail status and durations.
+  - local runner writes JSON summary to `artifacts/security/validate-security-summary.json` (override path via `P2P_VALIDATE_SECURITY_SUMMARY_PATH`).
+- Security retry knobs:
+  - `P2P_VALIDATE_SECURITY_RETRY_ATTEMPTS` (default `2`)
+  - `P2P_VALIDATE_SECURITY_RETRY_DELAY_MS` (default `2000`)
 - `validate-full` runs the aggregated pipeline `validate:full` (`smoke:all` -> `e2e:retry` -> `lint` -> `typecheck`).
 - `smoke-e2e-k6` also runs `load:k6:signaling:quick:summary` and uploads `artifacts/k6/*.json`.
 - `smoke-e2e-k6` writes key k6 metrics into `GitHub Step Summary`.
@@ -215,6 +260,7 @@ Manual pre-release validation:
    - full suite with auto-retry: `pnpm e2e:retry`
    - quick minimal flow only: `pnpm e2e:minimal`
    - quick minimal flow with auto-retry: `pnpm e2e:minimal:retry`
+   - reconnect/resume focused flow only: `pnpm e2e:reconnect`
 3. If app/infra is already running and you want to skip Playwright managed webServer:
    - `pnpm e2e:local`
    - quick minimal flow with existing local runtime: `pnpm e2e:minimal:local`
@@ -228,6 +274,11 @@ Current e2e scenario:
   - sender sends one text message
   - receiver gets the message
   - sender receives read receipt (`sent` -> `read`)
+- Reconnect and resume path (`@reconnect`):
+  - peer reconnect restores remote peer visibility after forced WS close
+  - text chat delivery recovers after forced signaling reconnect
+  - file transfer resumes/completes after forced reconnect (single and multi reconnects)
+  - missing file chunks are requested and recovered after reconnect
 - Opens two tabs
 - Joins both tabs into one room
 - Verifies both peers become visible (`Remote peers: 1`)
@@ -236,6 +287,9 @@ Current e2e scenario:
 - Verifies chat receipt state updates from `sent` to `read` on sender side
 - Verifies reaction sync by sending `👍` from receiver and asserting it appears on sender side
 - Sends one small file from tab A and verifies receiver status `completed` plus `Download` link
+- Forces signaling reconnect during active file transfer and verifies transfer resumes to `completed`
+- Forces multiple signaling reconnects during active file transfer and verifies transfer still reaches `completed`
+- Simulates dropped outgoing file chunks, forces reconnect, and verifies receiver requests only `missingChunks` before final `completed`
 - Verifies sender-side DataChannel wire payloads use encrypted envelope (`payload.type = encrypted`) and do not leak plaintext `text` / `file-chunk` payload types
 - Corrupts sender-side file checksum metadata and verifies receiver marks transfer as `failed` (`Checksum mismatch.`)
 - Forces signaling socket close for one peer and verifies reconnect restores `Remote peers: 1`
@@ -253,6 +307,7 @@ Current e2e scenario:
 - Peer key exchange now uses a backward-compatible signaling key bundle (`signing + ECDH` public keys in `peerPublicKey`), while legacy signing-only peers still work.
 - DataChannel payloads now support an encrypted envelope (`payload.type = encrypted`) with per-peer AES-256-GCM keys derived via ECDH.
 - File transfer chunks (`file-chunk`) are now also encrypted by the same envelope when peer ECDH keys are available.
+- Outgoing delivery logic is now split by intent: chat/reactions may use deferred queue retry, while `file-meta`/`file-chunk` use strict non-queued delivery to keep transfer progress/resume accounting correct.
 - Chat/file payload crypto logic is extracted into a dedicated client module with unit tests (bundle encode/decode, encrypted chunk path, plaintext fallback).
 - Crypto payload unit tests also cover malformed bundle handling, missing shared-key decrypt errors, and invalid decrypted schema rejection.
 - Client decrypt-path tests also cover corrupted ciphertext errors and non-string plaintext safety checks.
@@ -300,6 +355,16 @@ Current e2e scenario:
 - Client now keeps `roomId` in `sessionStorage` in sync with UI state, so page refresh restores the room field and reconnect flow consistently.
 - Room `sessionStorage` handling is extracted into a dedicated client utility with unit tests (`read/write/trim/clear + storage-failure safety`).
 - `@p2p/server` also has `AuthService` tests for refresh rotation, token reuse detection, and family revoke behavior.
+- `AuthService` now also supports explicit refresh-family revocation (`revoke`) used by logout flow.
+- Server now exposes `GET /auth/logout?token=<refreshToken>` to revoke refresh token family.
+- Server auth endpoints (`/auth/dev-login`, `/auth/refresh`, `/auth/logout`) now also support `HttpOnly` refresh cookie (`refreshToken`) and keep query-token fallback for backward compatibility.
+- Server now emits structured auth audit events (`auth_audit`) for `login`, `token_refresh`, `logout` including result, IP and user-agent.
+- Auth audit events are persisted in Redis (`auth:audit:events`) with retention controls via `AUTH_AUDIT_LOG_MAX_ENTRIES` and `AUTH_AUDIT_LOG_TTL_SECONDS`.
+- Server exposes `GET /auth/audit?limit=50` (requires `Authorization: Bearer <accessToken>`) to fetch latest persisted auth audit events for diagnostics.
+- Server now applies baseline security headers on HTTP routes (CSP, frame-ancestors deny, no-sniff, referrer policy, permissions policy, HSTS in production).
+- Client auth bootstrap now requests auth endpoints with `credentials: include` to support cookie-based refresh/logout flow in cross-origin local dev.
+- Client refresh path now attempts cookie-based `/auth/refresh` even when session refresh token is absent/expired in `sessionStorage`.
+- Client disconnect now calls `/auth/logout` (cookie/token aware), then clears local auth tokens.
 - `@p2p/shared` has schema contract tests for signaling/chat Zod parsers.
 - `@p2p/shared` schema tests include encrypted payload boundary checks (`ivBase64`/`ciphertextBase64` limits and invalid field types).
 - Signaling contract tests explicitly cover `join.peerPublicKey` in both legacy string form and `p2p-key-bundle-v1:<base64-json>` form.

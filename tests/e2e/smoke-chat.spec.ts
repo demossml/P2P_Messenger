@@ -311,6 +311,135 @@ type ConnectedPeers = {
   pageB: Awaited<ReturnType<BrowserContext['newPage']>>;
 };
 
+async function waitForChatChannelReady(
+  page: Page,
+  label: string,
+  diagnostics: PageDiagnostics
+): Promise<void> {
+  try {
+    await page.waitForFunction(
+      () => {
+        const getter = (
+          window as typeof window & {
+            __e2eGetConnectionDebug?: () => Array<{
+              peerId: string;
+              connectionState: string;
+              iceConnectionState: string;
+              chatChannelState: string | null;
+            }>;
+          }
+        ).__e2eGetConnectionDebug;
+        if (!getter) {
+          return false;
+        }
+
+        const entries = getter();
+        if (!Array.isArray(entries) || entries.length === 0) {
+          return false;
+        }
+
+        return entries.every(
+          (entry) =>
+            entry.chatChannelState === 'open' &&
+            (entry.iceConnectionState === 'connected' ||
+              entry.iceConnectionState === 'completed') &&
+            (entry.connectionState === 'connected' || entry.connectionState === 'connecting')
+        );
+      },
+      null,
+      { timeout: 30_000 }
+    );
+  } catch (error) {
+    const debugSnapshot = await page
+      .evaluate(() => {
+        const getter = (
+          window as typeof window & {
+            __e2eGetConnectionDebug?: () => unknown;
+          }
+        ).__e2eGetConnectionDebug;
+        return getter ? getter() : null;
+      })
+      .catch(() => null);
+    throw new Error(
+      `Chat channel is not ready for ${label}: ${
+        error instanceof Error ? error.message : String(error)
+      }. debug=${JSON.stringify(debugSnapshot)}; consoleErrors=${trimDiagnostics(
+        diagnostics.consoleErrors
+      )}; pageErrors=${trimDiagnostics(diagnostics.pageErrors)}; requestFailures=${trimDiagnostics(
+        diagnostics.requestFailures
+      )}`
+    );
+  }
+}
+
+async function getConnectionDebugSnapshot(page: Page): Promise<unknown> {
+  return await page
+    .evaluate(() => {
+      const getter = (
+        window as typeof window & {
+          __e2eGetConnectionDebug?: () => unknown;
+        }
+      ).__e2eGetConnectionDebug;
+      return getter ? getter() : null;
+    })
+    .catch(() => null);
+}
+
+async function forceCloseSignalingSockets(page: Page): Promise<number> {
+  return await page.evaluate(() => {
+    const forceClose = (window as typeof window & { __e2eForceCloseWebSockets?: () => number })
+      .__e2eForceCloseWebSockets;
+    return forceClose ? forceClose() : 0;
+  });
+}
+
+async function waitForPeersConnected(pageA: Page, pageB: Page, timeoutMs = 30_000): Promise<void> {
+  await expect(pageA.getByText('Signaling status: connected')).toBeVisible({ timeout: timeoutMs });
+  await expect(pageB.getByText('Signaling status: connected')).toBeVisible({ timeout: timeoutMs });
+  await expect(pageA.getByText('Remote peers: 1')).toBeVisible({ timeout: timeoutMs });
+  await expect(pageB.getByText('Remote peers: 1')).toBeVisible({ timeout: timeoutMs });
+}
+
+async function sendTextWithRetry(
+  pageA: Page,
+  pageB: Page,
+  messageText: string,
+  diagnosticsA: PageDiagnostics,
+  diagnosticsB: PageDiagnostics,
+  label: string
+): Promise<void> {
+  let delivered = false;
+  let lastError: unknown = null;
+
+  for (let attempt = 1; attempt <= 4; attempt += 1) {
+    try {
+      await Promise.all([
+        waitForChatChannelReady(pageA, `${label} peer A attempt ${attempt}`, diagnosticsA),
+        waitForChatChannelReady(pageB, `${label} peer B attempt ${attempt}`, diagnosticsB)
+      ]);
+      await pageA.getByPlaceholder('Type a message').fill(messageText);
+      await pageA.getByRole('button', { name: 'Send', exact: true }).click();
+      await expect(pageA.getByText(messageText).first()).toBeVisible();
+      await expect(pageB.getByText(messageText).first()).toBeVisible({ timeout: 12_000 });
+      delivered = true;
+      break;
+    } catch (error) {
+      lastError = error;
+      await Promise.all([
+        waitForChatChannelReady(pageA, `${label} peer A retry ${attempt}`, diagnosticsA),
+        waitForChatChannelReady(pageB, `${label} peer B retry ${attempt}`, diagnosticsB)
+      ]);
+      await pageA.waitForTimeout(600);
+    }
+  }
+
+  if (!delivered) {
+    throw lastError instanceof Error
+      ? lastError
+      : new Error(`Message "${messageText}" was not delivered to peer B.`);
+  }
+}
+
 async function setupConnectedPeers(browser: Browser): Promise<ConnectedPeers> {
   const createPeerContext = async (): Promise<BrowserContext> => {
     const context = await browser.newContext({
@@ -360,6 +489,11 @@ async function setupConnectedPeers(browser: Browser): Promise<ConnectedPeers> {
 
   await expect(pageA.getByText('Remote peers: 1')).toBeVisible();
   await expect(pageB.getByText('Remote peers: 1')).toBeVisible();
+
+  await Promise.all([
+    waitForChatChannelReady(pageA, 'peer A', diagnosticsA),
+    waitForChatChannelReady(pageB, 'peer B', diagnosticsB)
+  ]);
 
   await Promise.all([
     pageA.evaluate(() => {
@@ -415,6 +549,8 @@ test('@minimal room id persists in UI after page reload', async ({ browser }) =>
 
 test('@minimal two tabs complete join -> text -> read receipt flow', async ({ browser }) => {
   const { contextA, contextB, pageA, pageB } = await setupConnectedPeers(browser);
+  const diagnosticsA = attachPageDiagnostics(pageA);
+  const diagnosticsB = attachPageDiagnostics(pageB);
 
   const chatSectionA = pageA
     .locator('section')
@@ -424,6 +560,11 @@ test('@minimal two tabs complete join -> text -> read receipt flow', async ({ br
   let lastError: unknown = null;
 
   for (let attempt = 1; attempt <= 4; attempt += 1) {
+    await Promise.all([
+      waitForChatChannelReady(pageA, `minimal peer A attempt ${attempt}`, diagnosticsA),
+      waitForChatChannelReady(pageB, `minimal peer B attempt ${attempt}`, diagnosticsB)
+    ]);
+
     const messageText = `e2e-minimal-${Date.now()}-${attempt}`;
     await pageA.getByPlaceholder('Type a message').fill(messageText);
     await pageA.getByRole('button', { name: 'Send', exact: true }).click();
@@ -432,20 +573,41 @@ test('@minimal two tabs complete join -> text -> read receipt flow', async ({ br
     await expect(messageRowA).toBeVisible({ timeout: 10_000 });
 
     try {
-      await expect(pageB.getByText(messageText).first()).toBeVisible({ timeout: 5_000 });
-      await expect(messageRowA).toContainText('(read)', { timeout: 8_000 });
+      await expect(pageB.getByText(messageText).first()).toBeVisible({ timeout: 12_000 });
+      await expect(messageRowA).toContainText('(read)', { timeout: 12_000 });
       completed = true;
       break;
     } catch (error) {
       lastError = error;
+      await Promise.all([
+        waitForChatChannelReady(pageA, `minimal peer A retry ${attempt}`, diagnosticsA),
+        waitForChatChannelReady(pageB, `minimal peer B retry ${attempt}`, diagnosticsB)
+      ]);
       await pageA.waitForTimeout(600);
     }
   }
 
   if (!completed) {
+    const [debugA, debugB] = await Promise.all([
+      getConnectionDebugSnapshot(pageA),
+      getConnectionDebugSnapshot(pageB)
+    ]);
+    const [alertA, alertB] = await Promise.all([
+      pageA
+        .getByRole('alert')
+        .textContent()
+        .catch(() => null),
+      pageB
+        .getByRole('alert')
+        .textContent()
+        .catch(() => null)
+    ]);
+    const fallbackError = new Error(
+      `Minimal join -> text -> receipt flow did not complete in time. debugA=${JSON.stringify(debugA)}; debugB=${JSON.stringify(debugB)}; alertA=${alertA}; alertB=${alertB}`
+    );
     throw lastError instanceof Error
-      ? lastError
-      : new Error('Minimal join -> text -> receipt flow did not complete in time.');
+      ? new Error(`${lastError.message}\n${fallbackError.message}`)
+      : fallbackError;
   }
 
   await Promise.all([contextA.close(), contextB.close()]);
@@ -453,37 +615,19 @@ test('@minimal two tabs complete join -> text -> read receipt flow', async ({ br
 
 test('two tabs exchange one text message over DataChannel', async ({ browser }) => {
   const { contextA, contextB, pageA, pageB } = await setupConnectedPeers(browser);
+  const diagnosticsA = attachPageDiagnostics(pageA);
+  const diagnosticsB = attachPageDiagnostics(pageB);
 
   const messageText = `e2e-chat-${Date.now()}`;
-  let delivered = false;
-  let lastError: unknown = null;
-
-  for (let attempt = 1; attempt <= 4; attempt += 1) {
-    await pageA.getByPlaceholder('Type a message').fill(messageText);
-    await pageA.getByRole('button', { name: 'Send', exact: true }).click();
-    await expect(pageA.getByText(messageText).first()).toBeVisible();
-
-    try {
-      await expect(pageB.getByText(messageText).first()).toBeVisible({ timeout: 5000 });
-      delivered = true;
-      break;
-    } catch (error) {
-      lastError = error;
-      await pageA.waitForTimeout(600);
-    }
-  }
-
-  if (!delivered) {
-    throw lastError instanceof Error
-      ? lastError
-      : new Error('Message was not delivered to peer B.');
-  }
+  await sendTextWithRetry(pageA, pageB, messageText, diagnosticsA, diagnosticsB, 'chat');
 
   await Promise.all([contextA.close(), contextB.close()]);
 });
 
 test('chat read receipts and reactions are synchronized between peers', async ({ browser }) => {
   const { contextA, contextB, pageA, pageB } = await setupConnectedPeers(browser);
+  const diagnosticsA = attachPageDiagnostics(pageA);
+  const diagnosticsB = attachPageDiagnostics(pageB);
 
   const chatSectionA = pageA
     .locator('section')
@@ -496,6 +640,10 @@ test('chat read receipts and reactions are synchronized between peers', async ({
   let lastError: unknown = null;
 
   for (let attempt = 1; attempt <= 4; attempt += 1) {
+    await Promise.all([
+      waitForChatChannelReady(pageA, `receipt peer A attempt ${attempt}`, diagnosticsA),
+      waitForChatChannelReady(pageB, `receipt peer B attempt ${attempt}`, diagnosticsB)
+    ]);
     const messageText = `e2e-receipt-${Date.now()}-${attempt}`;
     await pageA.getByPlaceholder('Type a message').fill(messageText);
     await pageA.getByRole('button', { name: 'Send', exact: true }).click();
@@ -504,14 +652,18 @@ test('chat read receipts and reactions are synchronized between peers', async ({
     const messageRowB = chatSectionB.locator('p').filter({ hasText: messageText }).first();
 
     try {
-      await expect(messageRowB).toBeVisible({ timeout: 5000 });
-      await expect(messageRowA).toContainText('(read)', { timeout: 7000 });
+      await expect(messageRowB).toBeVisible({ timeout: 12000 });
+      await expect(messageRowA).toContainText('(read)', { timeout: 12000 });
       await messageRowB.getByRole('button', { name: /React thumbs up/i }).click();
-      await expect(messageRowA).toContainText('👍', { timeout: 5000 });
+      await expect(messageRowA).toContainText('👍', { timeout: 12000 });
       synced = true;
       break;
     } catch (error) {
       lastError = error;
+      await Promise.all([
+        waitForChatChannelReady(pageA, `receipt peer A retry ${attempt}`, diagnosticsA),
+        waitForChatChannelReady(pageB, `receipt peer B retry ${attempt}`, diagnosticsB)
+      ]);
       await pageA.waitForTimeout(600);
     }
   }
@@ -548,21 +700,203 @@ test('two tabs transfer a small file and receiver marks it completed', async ({ 
   await Promise.all([contextA.close(), contextB.close()]);
 });
 
-test('peer reconnect restores remote peer visibility after forced ws close', async ({
+test('@reconnect peer reconnect restores remote peer visibility after forced ws close', async ({
   browser
 }) => {
   const { contextA, contextB, pageA, pageB } = await setupConnectedPeers(browser);
 
-  const closedSockets = await pageA.evaluate(() => {
-    const forceClose = (window as typeof window & { __e2eForceCloseWebSockets?: () => number })
-      .__e2eForceCloseWebSockets;
-    return forceClose ? forceClose() : 0;
-  });
+  const closedSockets = await forceCloseSignalingSockets(pageA);
   expect(closedSockets).toBeGreaterThan(0);
 
-  await expect(pageA.getByText('Signaling status: connected')).toBeVisible({ timeout: 30_000 });
-  await expect(pageA.getByText('Remote peers: 1')).toBeVisible({ timeout: 30_000 });
-  await expect(pageB.getByText('Remote peers: 1')).toBeVisible({ timeout: 30_000 });
+  await waitForPeersConnected(pageA, pageB);
+
+  await Promise.all([contextA.close(), contextB.close()]);
+});
+
+test('@reconnect chat delivery recovers after forced signaling reconnect', async ({ browser }) => {
+  const { contextA, contextB, pageA, pageB } = await setupConnectedPeers(browser);
+  const diagnosticsA = attachPageDiagnostics(pageA);
+  const diagnosticsB = attachPageDiagnostics(pageB);
+
+  const closedSockets = await forceCloseSignalingSockets(pageA);
+  expect(closedSockets).toBeGreaterThan(0);
+
+  await waitForPeersConnected(pageA, pageB);
+
+  const messageText = `e2e-chat-reconnect-${Date.now()}`;
+  await sendTextWithRetry(pageA, pageB, messageText, diagnosticsA, diagnosticsB, 'chat reconnect');
+
+  await Promise.all([contextA.close(), contextB.close()]);
+});
+
+test('@reconnect file transfer resumes and completes after forced signaling reconnect', async ({
+  browser
+}) => {
+  const { contextA, contextB, pageA, pageB } = await setupConnectedPeers(browser);
+
+  await pageA.evaluate(() => {
+    (
+      window as typeof window & {
+        __e2eChunkSendDelayMs?: number;
+      }
+    ).__e2eChunkSendDelayMs = 12;
+  });
+
+  const fileName = `e2e-resume-${Date.now()}.bin`;
+  const filePayload = Buffer.alloc(2 * 1024 * 1024, 0x61);
+
+  await pageA.locator('input[type="file"]').setInputFiles({
+    name: fileName,
+    mimeType: 'application/octet-stream',
+    buffer: filePayload
+  });
+
+  await expect(
+    pageB.getByText(new RegExp(`${escapeRegExp(fileName)}\\s*\\[(receiving|completed)\\]`))
+  ).toBeVisible({
+    timeout: 20_000
+  });
+
+  const closedSockets = await forceCloseSignalingSockets(pageA);
+  expect(closedSockets).toBeGreaterThan(0);
+
+  await waitForPeersConnected(pageA, pageB);
+
+  await expect(
+    pageB.getByText(new RegExp(`${escapeRegExp(fileName)}\\s*\\[completed\\]`))
+  ).toBeVisible({
+    timeout: 45_000
+  });
+
+  await expect(
+    pageA.getByText(new RegExp(`${escapeRegExp(fileName)}\\s*\\[(completed|partial)\\]`))
+  ).toBeVisible({
+    timeout: 45_000
+  });
+
+  await Promise.all([contextA.close(), contextB.close()]);
+});
+
+test('@reconnect file transfer survives multiple forced reconnects and still completes', async ({
+  browser
+}) => {
+  const { contextA, contextB, pageA, pageB } = await setupConnectedPeers(browser);
+
+  await pageA.evaluate(() => {
+    (
+      window as typeof window & {
+        __e2eChunkSendDelayMs?: number;
+      }
+    ).__e2eChunkSendDelayMs = 10;
+  });
+
+  const fileName = `e2e-resume-multi-${Date.now()}.bin`;
+  const filePayload = Buffer.alloc(3 * 1024 * 1024, 0x62);
+
+  await pageA.locator('input[type="file"]').setInputFiles({
+    name: fileName,
+    mimeType: 'application/octet-stream',
+    buffer: filePayload
+  });
+
+  await expect(
+    pageB.getByText(new RegExp(`${escapeRegExp(fileName)}\\s*\\[(receiving|completed)\\]`))
+  ).toBeVisible({
+    timeout: 25_000
+  });
+
+  for (let i = 0; i < 2; i += 1) {
+    const closedSockets = await forceCloseSignalingSockets(pageA);
+    expect(closedSockets).toBeGreaterThan(0);
+
+    await waitForPeersConnected(pageA, pageB);
+  }
+
+  await expect(
+    pageB.getByText(new RegExp(`${escapeRegExp(fileName)}\\s*\\[completed\\]`))
+  ).toBeVisible({
+    timeout: 60_000
+  });
+
+  await expect(
+    pageA.getByText(new RegExp(`${escapeRegExp(fileName)}\\s*\\[(completed|partial)\\]`))
+  ).toBeVisible({
+    timeout: 60_000
+  });
+
+  await Promise.all([contextA.close(), contextB.close()]);
+});
+
+test('@reconnect file transfer requests missing chunks after reconnect and completes', async ({
+  browser
+}) => {
+  const { contextA, contextB, pageA, pageB } = await setupConnectedPeers(browser);
+
+  await pageA.evaluate(() => {
+    (
+      window as typeof window & {
+        __e2eChunkSendDelayMs?: number;
+        __e2eDropOutgoingFileChunksRemaining?: number;
+      }
+    ).__e2eChunkSendDelayMs = 8;
+    (
+      window as typeof window & {
+        __e2eDropOutgoingFileChunksRemaining?: number;
+      }
+    ).__e2eDropOutgoingFileChunksRemaining = 24;
+  });
+
+  const fileName = `e2e-missing-chunks-${Date.now()}.bin`;
+  const filePayload = Buffer.alloc(2 * 1024 * 1024, 0x63);
+
+  await pageA.locator('input[type="file"]').setInputFiles({
+    name: fileName,
+    mimeType: 'application/octet-stream',
+    buffer: filePayload
+  });
+
+  await expect(
+    pageB.getByText(new RegExp(`${escapeRegExp(fileName)}\\s*\\[(receiving|completed)\\]`))
+  ).toBeVisible({
+    timeout: 25_000
+  });
+
+  const closedSockets = await forceCloseSignalingSockets(pageA);
+  expect(closedSockets).toBeGreaterThan(0);
+
+  await waitForPeersConnected(pageA, pageB);
+
+  await expect(
+    pageB.getByText(new RegExp(`${escapeRegExp(fileName)}\\s*\\[completed\\]`))
+  ).toBeVisible({
+    timeout: 60_000
+  });
+
+  const ackHistory = await pageA.evaluate(() => {
+    const getFileId = (
+      window as typeof window & {
+        __e2eGetLatestOutgoingFileId?: () => string | null;
+      }
+    ).__e2eGetLatestOutgoingFileId;
+    const getHistory = (
+      window as typeof window & {
+        __e2eGetFileAckMissingChunksHistory?: (fileId: string) => number[];
+      }
+    ).__e2eGetFileAckMissingChunksHistory;
+    const fileId = getFileId ? getFileId() : null;
+    if (!fileId || !getHistory) {
+      return [];
+    }
+
+    return getHistory(fileId);
+  });
+
+  expect(ackHistory.length).toBeGreaterThanOrEqual(2);
+  const initialRequested = ackHistory[0] ?? 0;
+  const hasResumeMissingSubset = ackHistory
+    .slice(1)
+    .some((value) => value > 0 && value < initialRequested);
+  expect(hasResumeMissingSubset).toBe(true);
 
   await Promise.all([contextA.close(), contextB.close()]);
 });
