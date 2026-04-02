@@ -1,4 +1,4 @@
-import { expect, test, type Browser, type BrowserContext } from '@playwright/test';
+import { expect, test, type Browser, type BrowserContext, type Page } from '@playwright/test';
 
 type DevSession = {
   accessToken: string;
@@ -33,8 +33,64 @@ async function seedSession(context: BrowserContext, session: DevSession): Promis
   );
 }
 
+async function waitForAppReady(page: Page, label: string): Promise<void> {
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    try {
+      await expect(page.getByRole('heading', { name: 'P2P Messenger' })).toBeVisible({
+        timeout: 20_000
+      });
+      await expect(page.locator('#roomId')).toBeVisible({ timeout: 20_000 });
+      return;
+    } catch (error) {
+      if (attempt === 2) {
+        throw new Error(
+          `App is not ready for ${label}: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        );
+      }
+      await page.reload({ waitUntil: 'domcontentloaded' });
+    }
+  }
+}
+
 async function installFakeMedia(context: BrowserContext): Promise<void> {
   await context.addInitScript(() => {
+    const sentPayloadTypes: string[] = [];
+    const dataChannelProto = (window as typeof window & { RTCDataChannel?: { prototype?: { send?: (data: unknown) => unknown } } }).RTCDataChannel?.prototype;
+    if (dataChannelProto?.send) {
+      const nativeSend = dataChannelProto.send.bind(dataChannelProto);
+      dataChannelProto.send = function patchedSend(data: unknown): void {
+        if (typeof data === 'string') {
+          try {
+            const parsed = JSON.parse(data) as { payload?: { type?: unknown } };
+            const payloadType = parsed?.payload?.type;
+            if (typeof payloadType === 'string') {
+              sentPayloadTypes.push(payloadType);
+            }
+          } catch {
+            // Ignore non-JSON payloads.
+          }
+        }
+
+        nativeSend.call(this, data);
+      };
+    }
+
+    Object.defineProperty(window, '__e2eGetSentPayloadTypes', {
+      configurable: true,
+      writable: false,
+      value: () => [...sentPayloadTypes]
+    });
+
+    Object.defineProperty(window, '__e2eResetSentPayloadTypes', {
+      configurable: true,
+      writable: false,
+      value: () => {
+        sentPayloadTypes.length = 0;
+      }
+    });
+
     const nativeWebSocket = window.WebSocket;
     const trackedSockets = new Set<WebSocket>();
 
@@ -218,7 +274,11 @@ async function setupConnectedPeers(browser: Browser): Promise<ConnectedPeers> {
   const pageA = await contextA.newPage();
   const pageB = await contextB.newPage();
 
-  await Promise.all([pageA.goto('/'), pageB.goto('/')]);
+  await Promise.all([
+    pageA.goto('/', { waitUntil: 'domcontentloaded' }),
+    pageB.goto('/', { waitUntil: 'domcontentloaded' })
+  ]);
+  await Promise.all([waitForAppReady(pageA, 'peer A'), waitForAppReady(pageB, 'peer B')]);
 
   const roomId = `e2e-room-${Date.now()}`;
 
@@ -235,6 +295,21 @@ async function setupConnectedPeers(browser: Browser): Promise<ConnectedPeers> {
 
   await expect(pageA.getByText('Remote peers: 1')).toBeVisible();
   await expect(pageB.getByText('Remote peers: 1')).toBeVisible();
+
+  await Promise.all([
+    pageA.evaluate(() => {
+      const reset = (
+        window as typeof window & { __e2eResetSentPayloadTypes?: () => void }
+      ).__e2eResetSentPayloadTypes;
+      reset?.();
+    }),
+    pageB.evaluate(() => {
+      const reset = (
+        window as typeof window & { __e2eResetSentPayloadTypes?: () => void }
+      ).__e2eResetSentPayloadTypes;
+      reset?.();
+    })
+  ]);
 
   return { contextA, contextB, pageA, pageB };
 }
@@ -421,6 +496,40 @@ test('corrupted file checksum is detected and both peers mark transfer as failed
     .first();
   await expect(senderFailedLine).toBeVisible({ timeout: 20_000 });
   await expect(senderFailedLine).toContainText('Checksum mismatch.');
+
+  await Promise.all([contextA.close(), contextB.close()]);
+});
+
+test('DataChannel messages use encrypted payload envelope for text and file transfer', async ({ browser }) => {
+  const { contextA, contextB, pageA, pageB } = await setupConnectedPeers(browser);
+
+  const messageText = `e2e-encrypted-${Date.now()}`;
+  await pageA.getByPlaceholder('Type a message').fill(messageText);
+  await pageA.getByRole('button', { name: 'Send', exact: true }).click();
+  await expect(pageB.getByText(messageText).first()).toBeVisible({ timeout: 10_000 });
+
+  const fileName = `e2e-encrypted-${Date.now()}.txt`;
+  const filePayload = Buffer.from(`enc-file-${Date.now()}`, 'utf8');
+  await pageA.locator('input[type="file"]').setInputFiles({
+    name: fileName,
+    mimeType: 'text/plain',
+    buffer: filePayload
+  });
+  await expect(pageB.getByText(new RegExp(`${escapeRegExp(fileName)}\\s*\\[completed\\]`))).toBeVisible({
+    timeout: 20_000
+  });
+
+  const payloadTypesA = await pageA.evaluate(() => {
+    const getTypes = (
+      window as typeof window & { __e2eGetSentPayloadTypes?: () => string[] }
+    ).__e2eGetSentPayloadTypes;
+    return getTypes ? getTypes() : [];
+  });
+
+  expect(payloadTypesA.length).toBeGreaterThan(0);
+  expect(payloadTypesA).toContain('encrypted');
+  expect(payloadTypesA).not.toContain('text');
+  expect(payloadTypesA).not.toContain('file-chunk');
 
   await Promise.all([contextA.close(), contextB.close()]);
 });

@@ -116,6 +116,9 @@ Manual pre-release validation:
    - `pnpm exec playwright install chromium`
 2. Run e2e smoke test:
    - `pnpm e2e`
+3. If app/infra is already running and you want to skip Playwright managed webServer:
+   - `pnpm e2e:local`
+   - (uses `PW_USE_MANAGED_WEBSERVER=0`)
 
 Current e2e scenario:
 - Opens two tabs
@@ -126,6 +129,7 @@ Current e2e scenario:
 - Verifies chat receipt state updates from `sent` to `read` on sender side
 - Verifies reaction sync by sending `👍` from receiver and asserting it appears on sender side
 - Sends one small file from tab A and verifies receiver status `completed` plus `Download` link
+- Verifies sender-side DataChannel wire payloads use encrypted envelope (`payload.type = encrypted`) and do not leak plaintext `text` / `file-chunk` payload types
 - Corrupts sender-side file checksum metadata and verifies receiver marks transfer as `failed` (`Checksum mismatch.`)
 - Forces signaling socket close for one peer and verifies reconnect restores `Remote peers: 1`
 - Verifies security fingerprint flow (`unverified` → `matched` → `unmatched` → `unverified`)
@@ -140,6 +144,9 @@ Current e2e scenario:
 - Peer key exchange now uses a backward-compatible signaling key bundle (`signing + ECDH` public keys in `peerPublicKey`), while legacy signing-only peers still work.
 - DataChannel payloads now support an encrypted envelope (`payload.type = encrypted`) with per-peer AES-256-GCM keys derived via ECDH.
 - File transfer chunks (`file-chunk`) are now also encrypted by the same envelope when peer ECDH keys are available.
+- Chat/file payload crypto logic is extracted into a dedicated client module with unit tests (bundle encode/decode, encrypted chunk path, plaintext fallback).
+- Crypto payload unit tests also cover malformed bundle handling, missing shared-key decrypt errors, and invalid decrypted schema rejection.
+- Client decrypt-path tests also cover corrupted ciphertext errors and non-string plaintext safety checks.
 - Incoming DataChannel messages are verified by signature and strict `senderId === peerId` binding.
 - Client persists signing keys in IndexedDB (`secure-kv`) and migrates legacy key material from `sessionStorage` on first load.
 - `peerPublicKey` used in signaling join now contains the exported SPKI public key.
@@ -183,6 +190,8 @@ Current e2e scenario:
 - Signaling join flow now safely handles same-socket rejoin with a different `peerId` (old peer session is left first), preventing stale peer-id mappings.
 - `@p2p/server` also has `AuthService` tests for refresh rotation, token reuse detection, and family revoke behavior.
 - `@p2p/shared` has schema contract tests for signaling/chat Zod parsers.
+- `@p2p/shared` schema tests include encrypted payload boundary checks (`ivBase64`/`ciphertextBase64` limits and invalid field types).
+- Signaling contract tests explicitly cover `join.peerPublicKey` in both legacy string form and `p2p-key-bundle-v1:<base64-json>` form.
 - `@p2p/webrtc` has tested utilities for adaptive bitrate (`setVideoBitrate`) and connection-quality assessment (`assessConnectionQuality` for packet loss/RTT/jitter).
 - `SignalingTransport` reconnect logic is hardened and covered by unit tests:
   - exponential backoff exhaustion path
@@ -212,6 +221,7 @@ Current e2e scenario:
   - ECDH key exchange + derived AES-256-GCM key
   - AES-GCM encrypt/decrypt helpers
   - SHA-256 and public key fingerprint helpers
+- `@p2p/crypto` now has unit tests for sign/verify, signing key serialization roundtrip, ECDH shared-key derivation, and ECDH key export/import roundtrip.
 
 ## Workspace layout
 - `apps/client` - React client

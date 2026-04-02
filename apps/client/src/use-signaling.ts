@@ -7,12 +7,9 @@ import {
   type ConnectionQuality
 } from '@p2p/webrtc';
 import {
-  base64ToBytes,
   bytesToBase64,
-  decryptAesGcm,
   deriveSharedAes256GcmKey,
   deserializeSigningKeyPair,
-  encryptAesGcm,
   exportEcdhPrivateKeyBase64,
   exportEcdhPublicKeyBase64,
   generateEcdhKeyPair,
@@ -25,7 +22,7 @@ import {
   signBytes,
   verifyBytes
 } from '@p2p/crypto';
-import { chatPlainPayloadSchema, type ChatMessage } from '@p2p/shared';
+import type { ChatMessage } from '@p2p/shared';
 import {
   assembleChunkMapToBytes,
   buildMissingChunkIndexes,
@@ -37,6 +34,12 @@ import {
   readSigningIdentityFromIndexedDb,
   writeSigningIdentityToIndexedDb
 } from './signing-key-store.js';
+import {
+  decodePeerPublicKeyBundle,
+  decryptPayloadWithSharedKey,
+  encodePeerPublicKeyBundle,
+  encryptPayloadWithSharedKey
+} from './chat-payload-crypto.js';
 
 type ConnectionStatus = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'closed';
 
@@ -125,11 +128,6 @@ type OutgoingPeerAckState = {
   error?: string;
 };
 
-type PeerPublicKeyBundle = {
-  signingPublicKeySpkiBase64: string;
-  ecdhPublicKeySpkiBase64?: string;
-};
-
 const PEER_ID_KEY = 'p2p.peerId';
 const PEER_PUBLIC_KEY_KEY = 'p2p.peerPublicKey';
 const PEER_PRIVATE_KEY_KEY = 'p2p.peerPrivateKey';
@@ -144,7 +142,6 @@ const FILE_META_MAX_RETRIES = 5;
 const RELAY_ENABLE_STREAK_REQUIRED = 2;
 const RELAY_DISABLE_STREAK_REQUIRED = 4;
 const RELAY_TOGGLE_COOLDOWN_MS = 15_000;
-const PEER_PUBLIC_KEY_BUNDLE_PREFIX = 'p2p-key-bundle-v1:';
 
 function getOrCreateStorageValue(key: string, fallbackFactory: () => string): string {
   const existingValue = sessionStorage.getItem(key);
@@ -229,45 +226,6 @@ function normalizeChunkIndexes(chunkIndexes: number[], totalChunks: number): num
   }
 
   return Array.from(normalized).sort((left, right) => left - right);
-}
-
-function encodePeerPublicKeyBundle(bundle: PeerPublicKeyBundle): string {
-  return `${PEER_PUBLIC_KEY_BUNDLE_PREFIX}${bytesToBase64(
-    new TextEncoder().encode(JSON.stringify(bundle))
-  )}`;
-}
-
-function decodePeerPublicKeyBundle(rawValue: string): PeerPublicKeyBundle {
-  if (!rawValue.startsWith(PEER_PUBLIC_KEY_BUNDLE_PREFIX)) {
-    return {
-      signingPublicKeySpkiBase64: rawValue
-    };
-  }
-
-  const encoded = rawValue.slice(PEER_PUBLIC_KEY_BUNDLE_PREFIX.length);
-  const decodedJson = new TextDecoder().decode(base64ToBytes(encoded));
-  const parsed = JSON.parse(decodedJson) as Partial<PeerPublicKeyBundle>;
-
-  if (
-    typeof parsed.signingPublicKeySpkiBase64 !== 'string' ||
-    parsed.signingPublicKeySpkiBase64.length === 0
-  ) {
-    throw new Error('Peer key bundle is missing signing key.');
-  }
-
-  if (
-    parsed.ecdhPublicKeySpkiBase64 !== undefined &&
-    (typeof parsed.ecdhPublicKeySpkiBase64 !== 'string' || parsed.ecdhPublicKeySpkiBase64.length === 0)
-  ) {
-    throw new Error('Peer key bundle has invalid ecdh key.');
-  }
-
-  return {
-    signingPublicKeySpkiBase64: parsed.signingPublicKeySpkiBase64,
-    ...(parsed.ecdhPublicKeySpkiBase64
-      ? { ecdhPublicKeySpkiBase64: parsed.ecdhPublicKeySpkiBase64 }
-      : {})
-  };
 }
 
 export function useSignaling(): {
@@ -410,69 +368,26 @@ export function useSignaling(): {
     return sharedKey;
   }
 
-async function encryptPayloadForPeer(
+  async function encryptPayloadForPeer(
     peerId: string,
     payload: ChatMessage['payload']
   ): Promise<ChatMessage['payload']> {
-    if (payload.type === 'encrypted') {
-      return payload;
-    }
-
     const sharedKey = await getOrCreateSharedEncryptionKey(peerId);
-    if (!sharedKey) {
-      return payload;
-    }
-
-    const encrypted = await encryptAesGcm(sharedKey, JSON.stringify(payload));
-    return {
-      type: 'encrypted',
-      ivBase64: encrypted.ivBase64,
-      ciphertextBase64: encrypted.ciphertextBase64
-    };
+    return encryptPayloadWithSharedKey(payload, sharedKey);
   }
 
   async function decryptPayloadFromPeer(
     peerId: string,
     payload: ChatMessage['payload']
   ): Promise<ChatMessage['payload'] | null> {
-    if (payload.type !== 'encrypted') {
-      return payload;
-    }
-
     const sharedKey = await getOrCreateSharedEncryptionKey(peerId);
-    if (!sharedKey) {
-      setLastError(`Missing encryption session key for peer ${peerId.slice(0, 8)}.`);
+    const decrypted = await decryptPayloadWithSharedKey(payload, sharedKey);
+    if (decrypted.error) {
+      setLastError(`Failed to decrypt message from ${peerId.slice(0, 8)}: ${decrypted.error}`);
       return null;
     }
 
-    try {
-      const plaintext = await decryptAesGcm(
-        sharedKey,
-        {
-          ivBase64: payload.ivBase64,
-          ciphertextBase64: payload.ciphertextBase64
-        },
-        'string'
-      );
-      if (typeof plaintext !== 'string') {
-        setLastError(`Rejected encrypted payload with invalid plaintext type from ${peerId.slice(0, 8)}.`);
-        return null;
-      }
-      const parsed = JSON.parse(plaintext) as unknown;
-      const validated = chatPlainPayloadSchema.safeParse(parsed);
-      if (!validated.success) {
-        setLastError(`Rejected encrypted payload with invalid schema from ${peerId.slice(0, 8)}.`);
-        return null;
-      }
-      return validated.data;
-    } catch (error) {
-      setLastError(
-        error instanceof Error
-          ? `Failed to decrypt message from ${peerId.slice(0, 8)}: ${error.message}`
-          : `Failed to decrypt message from ${peerId.slice(0, 8)}.`
-      );
-      return null;
-    }
+    return decrypted.payload;
   }
 
   async function createSignedMessageForPeer(

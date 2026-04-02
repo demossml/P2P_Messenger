@@ -21,6 +21,17 @@ function parseJson(raw) {
   }
 }
 
+function buildPeerPublicKeyBundle(signingPublicKeySpkiBase64, ecdhPublicKeySpkiBase64) {
+  const encoded = Buffer.from(
+    JSON.stringify({
+      signingPublicKeySpkiBase64,
+      ecdhPublicKeySpkiBase64
+    }),
+    'utf8'
+  ).toString('base64');
+  return `p2p-key-bundle-v1:${encoded}`;
+}
+
 async function fetchJson(url) {
   const response = await fetch(url);
   if (!response.ok) {
@@ -117,7 +128,10 @@ async function main() {
   };
   const peerB = {
     peerId: randomUUID(),
-    peerPublicKey: `smoke-public-key-b-${Date.now()}`
+    peerPublicKey: buildPeerPublicKeyBundle(
+      `smoke-signing-public-key-b-${Date.now()}`,
+      `smoke-ecdh-public-key-b-${Date.now()}`
+    )
   };
 
   const { ws: wsA, messages: messagesA } = await connectPeer({

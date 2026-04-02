@@ -1,5 +1,8 @@
 import { defineConfig, devices } from '@playwright/test';
 
+const useManagedWebServer = process.env.PW_USE_MANAGED_WEBSERVER !== '0';
+const baseURL = process.env.PW_BASE_URL ?? 'http://localhost:5173';
+
 export default defineConfig({
   testDir: './tests/e2e',
   timeout: 60_000,
@@ -9,7 +12,7 @@ export default defineConfig({
   fullyParallel: false,
   retries: 0,
   use: {
-    baseURL: 'http://localhost:5173',
+    baseURL,
     trace: 'on-first-retry'
   },
   projects: [
@@ -18,10 +21,14 @@ export default defineConfig({
       use: { ...devices['Desktop Chrome'] }
     }
   ],
-  webServer: {
-    command: 'pnpm dev:all',
-    url: 'http://localhost:5173',
-    timeout: 300_000,
-    reuseExistingServer: true
-  }
+  ...(useManagedWebServer
+    ? {
+        webServer: {
+          command: 'pnpm dev:all',
+          url: baseURL,
+          timeout: 300_000,
+          reuseExistingServer: true
+        }
+      }
+    : {})
 });

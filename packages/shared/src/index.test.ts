@@ -18,6 +18,27 @@ describe('signalingInboundSchema', () => {
     expect(message.type).toBe('join');
   });
 
+  it('parses valid join message with peerPublicKey bundle string', () => {
+    const bundle = Buffer.from(
+      JSON.stringify({
+        signingPublicKeySpkiBase64: 'signing-spki-base64',
+        ecdhPublicKeySpkiBase64: 'ecdh-spki-base64'
+      }),
+      'utf8'
+    ).toString('base64');
+
+    const message = signalingInboundSchema.parse({
+      type: 'join',
+      roomId: 'team-room-bundle',
+      peerId: '12121212-1212-4121-8121-121212121212',
+      token: '1234567890abcdef',
+      peerPublicKey: `p2p-key-bundle-v1:${bundle}`
+    });
+
+    expect(message.type).toBe('join');
+    expect(message.peerPublicKey.startsWith('p2p-key-bundle-v1:')).toBe(true);
+  });
+
   it('rejects invalid candidate payload type', () => {
     const parsed = signalingInboundSchema.safeParse({
       type: 'ice-candidate',
@@ -91,5 +112,53 @@ describe('chatMessageSchema', () => {
     });
 
     expect(parsed.payload.type).toBe('encrypted');
+  });
+
+  it('rejects encrypted payload with oversized iv', () => {
+    const parsed = chatMessageSchema.safeParse({
+      id: '99999999-9999-4999-8999-999999999999',
+      timestamp: Date.now(),
+      senderId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      signature: 'base64-signature',
+      payload: {
+        type: 'encrypted',
+        ivBase64: 'x'.repeat(257),
+        ciphertextBase64: 'ok'
+      }
+    });
+
+    expect(parsed.success).toBe(false);
+  });
+
+  it('rejects encrypted payload with oversized ciphertext', () => {
+    const parsed = chatMessageSchema.safeParse({
+      id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+      timestamp: Date.now(),
+      senderId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+      signature: 'base64-signature',
+      payload: {
+        type: 'encrypted',
+        ivBase64: 'ok',
+        ciphertextBase64: 'x'.repeat(200_001)
+      }
+    });
+
+    expect(parsed.success).toBe(false);
+  });
+
+  it('rejects encrypted payload with non-string fields', () => {
+    const parsed = chatMessageSchema.safeParse({
+      id: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+      timestamp: Date.now(),
+      senderId: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee',
+      signature: 'base64-signature',
+      payload: {
+        type: 'encrypted',
+        ivBase64: 123,
+        ciphertextBase64: true
+      }
+    });
+
+    expect(parsed.success).toBe(false);
   });
 });
