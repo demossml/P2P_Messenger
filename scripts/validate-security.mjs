@@ -3,10 +3,10 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
 const STEPS = [
-  { label: 'smoke:http:security', args: ['smoke:http:security'] },
-  { label: 'smoke:auth:reuse-only', args: ['smoke:auth:reuse-only'] },
-  { label: 'smoke:auth:audit-only', args: ['smoke:auth:audit-only'] },
-  { label: 'smoke:ws:negative', args: ['smoke:ws:negative'] }
+  { label: 'smoke:http:security:retry', args: ['smoke:http:security:retry'] },
+  { label: 'smoke:auth:reuse-only:retry', args: ['smoke:auth:reuse-only:retry'] },
+  { label: 'smoke:auth:audit-only:retry', args: ['smoke:auth:audit-only:retry'] },
+  { label: 'smoke:ws:negative:retry', args: ['smoke:ws:negative:retry'] }
 ];
 const SUMMARY_PATH =
   process.env.P2P_VALIDATE_SECURITY_SUMMARY_PATH ??
@@ -50,33 +50,37 @@ async function writeSummaryFile({
 }
 
 function hintsForStep(stepLabel) {
-  if (stepLabel === 'smoke:http:security') {
+  if (stepLabel === 'smoke:http:security:retry') {
     return [
       'Start local runtime first: `pnpm dev:all`.',
       'Verify health endpoint: `curl -fsS http://127.0.0.1:3001/health`.',
-      'Re-run just HTTP security checks: `pnpm smoke:http:security`.'
+      'Re-run just HTTP security checks with retry: `pnpm smoke:http:security:retry`.',
+      'Run non-retry variant for strict debugging: `pnpm smoke:http:security`.'
     ];
   }
 
-  if (stepLabel === 'smoke:auth:reuse-only') {
+  if (stepLabel === 'smoke:auth:reuse-only:retry') {
     return [
-      'Re-run auth reuse checks: `pnpm smoke:auth:reuse-only`.',
+      'Re-run auth reuse checks with retry: `pnpm smoke:auth:reuse-only:retry`.',
+      'Run non-retry variant for strict debugging: `pnpm smoke:auth:reuse-only`.',
       'If needed, run full auth smoke too: `pnpm smoke:auth`.',
       'Verify auth endpoints locally: `/auth/dev-login`, `/auth/refresh`, `/auth/logout`.'
     ];
   }
 
-  if (stepLabel === 'smoke:auth:audit-only') {
+  if (stepLabel === 'smoke:auth:audit-only:retry') {
     return [
-      'Re-run auth audit checks: `pnpm smoke:auth:audit-only`.',
+      'Re-run auth audit checks with retry: `pnpm smoke:auth:audit-only:retry`.',
+      'Run non-retry variant for strict debugging: `pnpm smoke:auth:audit-only`.',
       'Verify protected endpoint with bearer token: `GET /auth/audit?limit=20`.',
       'Ensure auth audit writes are enabled and Redis is reachable.'
     ];
   }
 
-  if (stepLabel === 'smoke:ws:negative') {
+  if (stepLabel === 'smoke:ws:negative:retry') {
     return [
-      'Re-run WS negative checks: `pnpm smoke:ws:negative`.',
+      'Re-run WS negative checks with retry: `pnpm smoke:ws:negative:retry`.',
+      'Run non-retry variant for strict debugging: `pnpm smoke:ws:negative`.',
       'Re-run strict WS suite if needed: `pnpm smoke:ws:strict`.',
       'Confirm signaling health: `curl -fsS http://127.0.0.1:3001/health`.'
     ];

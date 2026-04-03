@@ -112,6 +112,7 @@ You can still run checks separately if needed:
 - `pnpm smoke:http`
   - includes HTTP security-header assertions for auth/turn routes (`X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, `Permissions-Policy`, `CSP`)
 - `pnpm smoke:http:security` (same HTTP security-header assertions, useful as an explicit CI/manual target)
+- `pnpm smoke:http:security:retry` (retry wrapper for HTTP security smoke)
   - writes JSON summary to `artifacts/security/smoke-http-security-summary.json`
   - summary path can be overridden via `P2P_SMOKE_HTTP_SECURITY_SUMMARY_PATH`
 - `pnpm smoke:auth` (aggregated auth smoke: `smoke:auth:lifecycle-only` + `smoke:auth:reuse-only`)
@@ -120,14 +121,18 @@ You can still run checks separately if needed:
 - `pnpm smoke:auth:retry` (retry wrapper for aggregated auth smoke)
 - `pnpm smoke:auth:lifecycle-only` (auth cookie lifecycle: dev-login -> refresh(cookie) -> logout(cookie) -> refresh denied with `UNAUTHORIZED`)
 - `pnpm smoke:auth:reuse-only` (focused refresh-token-family abuse check: old refresh reuse -> `TOKEN_REUSE_DETECTED`, then family blocked -> `UNAUTHORIZED`)
+- `pnpm smoke:auth:reuse-only:retry` (retry wrapper for focused refresh-token-family abuse check)
 - `pnpm smoke:auth:audit-only` (auth audit endpoint checks: `/auth/audit` requires bearer token, rejects invalid token, returns own login audit event on success)
 - `pnpm smoke:auth:audit-only:retry` (retry wrapper for auth audit smoke)
   - writes JSON summary to `artifacts/security/auth-audit-smoke-summary.json`
   - summary path can be overridden via `P2P_AUTH_AUDIT_SMOKE_SUMMARY_PATH`
 - `pnpm smoke:ws`
 - `pnpm smoke:ws:limits` (fast schema-limit checks for oversized `join.peerPublicKey`, `offer.sdp`, `ice-candidate.candidate`)
-- `pnpm smoke:ws:strict` (runs `smoke:ws:limits` + `smoke:ws:negative`)
+- `pnpm smoke:ws:strict` (runs `smoke:ws:limits` + `smoke:ws:negative:retry`)
 - `pnpm smoke:ws:negative` (checks invalid `Origin` rejection, `INVALID_JSON`, `SCHEMA_VALIDATION_FAILED`, `RATE_LIMITED`, `ROOM_IS_FULL` paths)
+- `pnpm smoke:ws:negative:retry` (retry wrapper for WS negative checks)
+  - writes JSON summary to `artifacts/security/smoke-ws-negative-summary.json`
+  - summary path can be overridden via `P2P_SMOKE_WS_NEGATIVE_SUMMARY_PATH`
 - also checks oversized signaling schema payloads (`join.peerPublicKey`, `offer.sdp`, `ice-candidate.candidate`) are rejected with `SCHEMA_VALIDATION_FAILED`
 - also checks malformed `peerPublicKey` bundle marker does not crash signaling flow (backward/robustness scenario)
 
@@ -198,15 +203,16 @@ Manual pre-release validation:
   - `smoke-and-e2e`
   - `smoke-e2e-k6`
 - Starts local signaling + client runtime in CI, runs selected suites, and uploads logs/test artifacts.
-- `smoke-http-security` runs only `smoke:http:security` and writes `Smoke HTTP Security Summary` (`outcome`, `duration`, `pipeline`) to GitHub Step Summary.
+- `smoke-http-security` runs only `smoke:http:security:retry` and writes `Smoke HTTP Security Summary` (`outcome`, `duration`, `pipeline`) to GitHub Step Summary.
   - also renders per-step details from `artifacts/security/smoke-http-security-summary.json` (via `scripts/render-smoke-http-summary.mjs`) and uploads it as CI artifact.
 - `auth-smoke-only` runs `smoke:auth:retry` (`smoke:auth:lifecycle-only` + `smoke:auth:reuse-only` under retry wrapper) and writes `Auth Smoke Summary` (`outcome`, `duration`, `pipeline`) to GitHub Step Summary.
   - also renders per-step details from `artifacts/security/auth-smoke-summary.json` (via `scripts/render-auth-smoke-summary.mjs`) and uploads it as CI artifact.
 - `auth-audit-only` runs `smoke:auth:audit-only:retry` (protected `/auth/audit` checks with retry wrapper) and writes `Auth Audit Summary` (`outcome`, `duration`, `pipeline`) to GitHub Step Summary.
   - also renders per-step details from `artifacts/security/auth-audit-smoke-summary.json` (via `scripts/render-auth-audit-summary.mjs`) and uploads it as CI artifact.
 - `smoke-minimal` runs only `smoke:http` + `smoke:ws` (without negative-path suite).
-- `ws-strict-only` runs strict WS checks only (`smoke:ws:strict` = `smoke:ws:limits` + `smoke:ws:negative`), without HTTP smoke and without Playwright.
+- `ws-strict-only` runs strict WS checks only (`smoke:ws:strict` = `smoke:ws:limits` + `smoke:ws:negative:retry`), without HTTP smoke and without Playwright.
 - `ws-strict-only` writes a compact `WS Strict Summary` table (`outcome`, `duration`, `pipeline`) to GitHub Step Summary.
+  - also renders per-step details from `artifacts/security/smoke-ws-negative-summary.json` (via `scripts/render-smoke-ws-negative-summary.mjs`) and uploads it as CI artifact.
 - `smoke-minimal` writes a compact `Smoke Minimal Summary` table (`outcome`, `duration`, `pipeline`) to GitHub Step Summary.
 - `smoke-only` writes a compact `Smoke Full Summary` table (`outcome`, `duration`, `pipeline`) to GitHub Step Summary.
 - `smoke-and-e2e` writes a compact `Smoke And E2E Summary` table (overall/smoke/e2e outcomes + durations + pipeline) to GitHub Step Summary.
@@ -228,6 +234,15 @@ Manual pre-release validation:
 - Auth audit smoke retry knobs:
   - `P2P_AUTH_AUDIT_SMOKE_RETRY_ATTEMPTS` (default `2`)
   - `P2P_AUTH_AUDIT_SMOKE_RETRY_DELAY_MS` (default `1500`)
+- Auth reuse-only smoke retry knobs:
+  - `P2P_SMOKE_AUTH_REUSE_RETRY_ATTEMPTS` (default `2`)
+  - `P2P_SMOKE_AUTH_REUSE_RETRY_DELAY_MS` (default `1500`)
+- WS negative retry knobs:
+  - `P2P_SMOKE_WS_NEGATIVE_RETRY_ATTEMPTS` (default `2`)
+  - `P2P_SMOKE_WS_NEGATIVE_RETRY_DELAY_MS` (default `1500`)
+- HTTP security smoke retry knobs:
+  - `P2P_SMOKE_HTTP_SECURITY_RETRY_ATTEMPTS` (default `2`)
+  - `P2P_SMOKE_HTTP_SECURITY_RETRY_DELAY_MS` (default `1500`)
 - `e2e-minimal` runs only the fast Playwright `@minimal` flow (`join -> text -> read receipt`).
 - `e2e-reconnect-only` runs only reconnect/resume Playwright flow (`@reconnect` via `pnpm e2e:reconnect`).
 - `e2e-minimal` in CI uses `e2e:minimal:retry` (`2` attempts, `2000ms` delay by default).
@@ -240,7 +255,9 @@ Manual pre-release validation:
   - `P2P_E2E_FULL_RETRY_DELAY_MS` (default `3000`)
 - `validate-fast` runs the aggregated pipeline `validate:fast` (`smoke:minimal:retry` -> `e2e:minimal:retry`).
 - `validate-security` runs the aggregated pipeline `validate:security:retry` (`validate:security` with retries).
-  - underlying `validate:security` runner executes: `smoke:http:security -> smoke:auth:reuse-only -> smoke:auth:audit-only -> smoke:ws:negative` with step-specific local failure hints.
+  - underlying `validate:security` runner executes retry-aware steps:
+    - `smoke:http:security:retry -> smoke:auth:reuse-only:retry -> smoke:auth:audit-only:retry -> smoke:ws:negative:retry`
+  - non-retry variants remain available for strict debugging.
   - local runner also prints a compact per-step summary with pass/fail status and durations.
   - local runner writes JSON summary to `artifacts/security/validate-security-summary.json` (override path via `P2P_VALIDATE_SECURITY_SUMMARY_PATH`).
 - Security retry knobs:

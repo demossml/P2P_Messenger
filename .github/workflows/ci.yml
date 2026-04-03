@@ -191,7 +191,7 @@ jobs:
 
           set +e
           if [ "${{ github.event.inputs.validation }}" = "smoke-http-security" ]; then
-            pnpm smoke:http:security
+            pnpm smoke:http:security:retry
           elif [ "${{ github.event.inputs.validation }}" = "auth-smoke-only" ]; then
             pnpm smoke:auth:retry
           elif [ "${{ github.event.inputs.validation }}" = "auth-audit-only" ]; then
@@ -335,11 +335,12 @@ jobs:
           echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
           echo "| Outcome | \`$OUTCOME\` |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Duration | \`$DURATION_S\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Pipeline | \`smoke:http:security\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Pipeline | \`smoke:http:security:retry\` |" >> "$GITHUB_STEP_SUMMARY"
           if [ "$OUTCOME" != "success" ]; then
             echo "" >> "$GITHUB_STEP_SUMMARY"
             echo "Failure hints:" >> "$GITHUB_STEP_SUMMARY"
             echo "- Start local runtime: \`pnpm dev:all\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Re-run HTTP security smoke with retry: \`pnpm smoke:http:security:retry\`" >> "$GITHUB_STEP_SUMMARY"
             echo "- Re-run HTTP security smoke locally: \`pnpm smoke:http:security\`" >> "$GITHUB_STEP_SUMMARY"
             echo "- Verify health endpoint: \`curl -fsS http://127.0.0.1:3001/health\`" >> "$GITHUB_STEP_SUMMARY"
             echo "- Inspect uploaded runtime logs: \`/tmp/signaling.log\`, \`/tmp/client.log\`" >> "$GITHUB_STEP_SUMMARY"
@@ -387,16 +388,44 @@ jobs:
           echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
           echo "| Outcome | \`$OUTCOME\` |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Duration | \`$DURATION_S\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Pipeline | \`smoke:ws:limits -> smoke:ws:negative\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Pipeline | \`smoke:ws:limits -> smoke:ws:negative:retry\` |" >> "$GITHUB_STEP_SUMMARY"
           if [ "$OUTCOME" != "success" ]; then
             echo "" >> "$GITHUB_STEP_SUMMARY"
             echo "Failure hints:" >> "$GITHUB_STEP_SUMMARY"
             echo "- Start local runtime: \`pnpm dev:all\`" >> "$GITHUB_STEP_SUMMARY"
             echo "- Re-run strict WS locally: \`pnpm smoke:ws:strict\`" >> "$GITHUB_STEP_SUMMARY"
             echo "- Isolate limits only: \`pnpm smoke:ws:limits\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Re-run WS negative with retry: \`pnpm smoke:ws:negative:retry\`" >> "$GITHUB_STEP_SUMMARY"
             echo "- Isolate negative only: \`pnpm smoke:ws:negative\`" >> "$GITHUB_STEP_SUMMARY"
             echo "- Verify health endpoint: \`curl -fsS http://127.0.0.1:3001/health\`" >> "$GITHUB_STEP_SUMMARY"
             echo "- Inspect uploaded runtime logs: \`/tmp/signaling.log\`, \`/tmp/client.log\`" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Render ws-negative JSON summary
+        if: ${{ always() && github.event.inputs.validation == 'ws-strict-only' }}
+        run: |
+          SUMMARY_FILE="artifacts/security/smoke-ws-negative-summary.json"
+          OUTCOME="${{ steps.smoke_suite.outcome }}"
+          DURATION_S="n/a"
+          if [ -f /tmp/smoke_suite_duration_s ]; then
+            DURATION_S="$(cat /tmp/smoke_suite_duration_s)s"
+          fi
+          echo "### WS Negative Step Details" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f "$SUMMARY_FILE" ]; then
+            node scripts/render-smoke-ws-negative-summary.mjs "$SUMMARY_FILE" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+            echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Summary file | \`missing\` |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Expected path | \`$SUMMARY_FILE\` |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Smoke suite outcome | \`$OUTCOME\` |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Smoke suite duration | \`$DURATION_S\` |" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Troubleshooting:" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Ensure \`scripts/smoke-ws-negative.mjs\` completed its summary write path." >> "$GITHUB_STEP_SUMMARY"
+            echo "- Re-run locally: \`pnpm smoke:ws:negative\` and confirm \`artifacts/security/smoke-ws-negative-summary.json\` exists." >> "$GITHUB_STEP_SUMMARY"
+            echo "- Check runtime logs artifact for early process termination before summary write." >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Render smoke-minimal summary
@@ -963,7 +992,7 @@ jobs:
           if-no-files-found: warn
 
       - name: Upload security artifacts
-        if: ${{ always() && (github.event.inputs.validation == 'validate-security' || github.event.inputs.validation == 'auth-smoke-only' || github.event.inputs.validation == 'auth-audit-only' || github.event.inputs.validation == 'smoke-http-security') }}
+        if: ${{ always() && (github.event.inputs.validation == 'validate-security' || github.event.inputs.validation == 'auth-smoke-only' || github.event.inputs.validation == 'auth-audit-only' || github.event.inputs.validation == 'smoke-http-security' || github.event.inputs.validation == 'ws-strict-only') }}
         uses: actions/upload-artifact@v4
         with:
           name: security-artifacts-${{ github.run_id }}
